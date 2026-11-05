@@ -40,6 +40,8 @@ coverage/
 *.pem
 .cache/
 .turbo/
+signing-key-*.json
+players.json
 
 # OS files
 .DS_Store
