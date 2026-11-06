@@ -4,17 +4,26 @@
 // rings and sparks), the creature spinning in, its rarity wiped on, then the details. Reduced motion
 // keeps only the fades.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import Link from "next/link";
 import ModelViewer from "@/components/ModelViewer";
 
 export type Reveal = {
   creatureId: bigint;
   rarity: string;
-  float: number;
   businessName: string;
   description: string;
   modelUrl: string;
+  /** Where the creature's Arkiv entity is: the claim on chain is final, the Arkiv mirror follows it. */
+  arkiv: "transferring" | "arrived" | "pending" | "approval";
+  entityKey: string;
+};
+
+const ARKIV_TEXT: Record<Reveal["arkiv"], string> = {
+  transferring: "Moving it to you on Arkiv…",
+  arrived: "On Arkiv: it's yours ✓",
+  pending: "Arkiv transfer still running; it will appear in your collection shortly",
+  approval: "The business approves the Arkiv transfer; it then appears in your collection",
 };
 
 const RARITY_HEX: Record<string, string> = {
@@ -30,7 +39,6 @@ const reducedMotion = () => typeof matchMedia === "function" && matchMedia("(pre
 export default function CatchReveal({ reveal, onClose }: { reveal: Reveal; onClose: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const modelRef = useRef<HTMLDivElement>(null);
-  const [shownFloat, setShownFloat] = useState(reducedMotion() ? reveal.float : 0);
   const rarity = RARITY_HEX[reveal.rarity] ? reveal.rarity : "COMMON";
 
   useEffect(() => {
@@ -38,20 +46,6 @@ export default function CatchReveal({ reveal, onClose }: { reveal: Reveal; onClo
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
-
-  // Float counts up once the stats appear.
-  useEffect(() => {
-    if (reducedMotion()) return;
-    let raf = 0;
-    const start = performance.now() + 750;
-    const tick = (now: number) => {
-      const t = Math.min(1, Math.max(0, (now - start) / 900));
-      setShownFloat(reveal.float * (1 - Math.pow(1 - t, 4)));
-      if (t < 1) raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [reveal.float]);
 
   // Sparks: a single burst from the creature, falling under light gravity. Stops by itself.
   useEffect(() => {
@@ -132,8 +126,8 @@ export default function CatchReveal({ reveal, onClose }: { reveal: Reveal; onClo
 
         <div className="reveal-stats">
           <div className="reveal-stat">
-            <span>Float</span>
-            <b className="num mono">{shownFloat.toFixed(6)}</b>
+            <span>Campaign</span>
+            <b className="num">{(reveal.creatureId >> BigInt(32)).toString()}</b>
           </div>
           <div className="reveal-stat">
             <span>Creature</span>
@@ -142,6 +136,12 @@ export default function CatchReveal({ reveal, onClose }: { reveal: Reveal; onClo
           <div className="reveal-stat reveal-stat-wide">
             <span>Reward</span>
             <b>{reveal.description || "Discount from " + reveal.businessName}</b>
+          </div>
+          <div className="reveal-stat reveal-stat-wide" aria-live="polite">
+            <span>Arkiv</span>
+            <b>
+              {reveal.arkiv === "transferring" && <span className="spinner" aria-hidden="true" />} {ARKIV_TEXT[reveal.arkiv]}
+            </b>
           </div>
         </div>
 

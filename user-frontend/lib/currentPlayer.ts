@@ -6,5 +6,5 @@ import { getPlayer } from "@/lib/players";
 export async function currentPlayer() {
   const id = read((await cookies()).get("session")?.value);
   const player = id ? await getPlayer(id) : null;
-  return player && id ? { id, ...player } : null;
+  return player && id ? { id, ...player, wallet: player.wallet as `0x${string}` } : null;
 }

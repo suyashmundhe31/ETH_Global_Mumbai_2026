@@ -6,6 +6,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import { NotAllocatedError, NotReadyError } from "./campaignArkiv.js";
 import { CodeAccessError, isEncryptedCode } from "./discountCodes.js";
+import { same, SettlerRequestError, settlementView } from "./settler.js";
 import { GlbValidationError, parseGlb } from "./glb.js";
 import { campaignKey } from "./state.js";
 import { createLogger, errMessage, toJson } from "./util.js";
@@ -20,7 +21,7 @@ class HttpError extends Error {
   }
 }
 
-export function createApi({ config, chain, swarm, state, service, codes, logger }) {
+export function createApi({ config, chain, swarm, state, service, codes, arkiv, market, settler, settlerAddress, logger }) {
   const log = logger || createLogger("api");
 
   async function assetPath(name) {
@@ -34,6 +35,26 @@ export function createApi({ config, chain, swarm, state, service, codes, logger 
       throw new HttpError(404, `Asset ${name} not found`);
     }
     return full;
+  }
+
+  /**
+   * Approval campaigns: creatures claimed on CreatureMarket whose Arkiv entity is still held by the
+   * business. The business approves them (catched = true + ownership -> the current on-chain owner).
+   */
+  async function approvalsFor(id, business) {
+    const claimed = await market.claimedCount(id);
+    if (!claimed) return [];
+    const entities = await arkiv.findCampaignEntities({ creator: business, chainId: chain.chainId, contract: chain.address, campaignId: id });
+    const out = [];
+    for (let i = 0; i < claimed; i++) {
+      const creatureId = ((BigInt(id) << 32n) | BigInt(i)).toString();
+      const e = (entities.get(creatureId) || []).find((x) => same(x.owner, business));
+      if (!e) continue;
+      const h = await market.getHolding(creatureId);
+      if (same(h.owner, business)) continue;
+      out.push({ creatureId, entityKey: e.key, player: h.owner, redeemed: h.redeemed, rarity: e.rarity });
+    }
+    return out;
   }
 
   async function campaignView(id) {
@@ -104,9 +125,15 @@ export function createApi({ config, chain, swarm, state, service, codes, logger 
         lastError: st.lastError ?? null,
         verifiedAt: st.verifiedAt ?? null,
         expirationMode: st.expirationMode ?? null,
-        creator: onChain.business, // $creator and $owner of every entity = the business wallet
+        creator: onChain.business, // $creator of every entity = the business wallet
         schema: config.arkiv.schemaName,
         explorer: config.arkiv.explorerUrl,
+      },
+      // Approval / Auto settle + the business's notification feed of automatic transfers.
+      settlement: {
+        ...settlementView({ state, key, settler: settlerAddress, business: onChain.business }),
+        approvals: onChain.statusName === "ALLOCATED" ? await approvalsFor(id, onChain.business) : [],
+        claimed: onChain.statusName === "ALLOCATED" ? await market.claimedCount(id) : 0,
       },
       creatures,
     };
@@ -127,6 +154,10 @@ export function createApi({ config, chain, swarm, state, service, codes, logger 
         arkivNetwork: config.arkiv.network,
         arkivSchema: config.arkiv.schemaName,
         arkivBatchSize: config.arkiv.batchSize,
+        // CreatureMarket (claim / redeem / marketplace) and the settler wallet that holds Auto-settle
+        // creatures and marketplace escrows on Arkiv.
+        creatureMarket: market.address,
+        settlerAddress,
         // Only for ARKIV_NETWORK=localhost; on Rabdi the browser uses the SDK's chain definition.
         arkivRpcUrl: config.arkiv.network === "localhost" ? config.arkiv.rpcUrl || null : null,
       }),
@@ -176,7 +207,7 @@ export function createApi({ config, chain, swarm, state, service, codes, logger 
     [
       "POST",
       /^\/api\/campaigns\/(\d+)\/arkiv\/submissions$/,
-      async (_req, m, body) => arkivCall(() => service.recordSubmission(BigInt(m[1]), { txHash: body?.txHash, entries: body?.entries })),
+      async (_req, m, body) => arkivCall(() => service.recordSubmission(BigInt(m[1]), { txHash: body?.txHash, entries: body?.entries, pending: body?.pending })),
     ],
     ["POST", /^\/api\/campaigns\/(\d+)\/arkiv\/verify$/, async (_req, m) => arkivCall(() => service.verify(BigInt(m[1])))],
     // Discount codes: encrypted with the worker's key BEFORE createCampaign, so the chain, the
@@ -186,7 +217,14 @@ export function createApi({ config, chain, swarm, state, service, codes, logger 
       /^\/api\/discount-codes\/encrypt$/,
       async (_req, _m, body) => arkivCall(() => ({ codes: codes.encryptRewardCodes({ business: body?.business, codes: body?.codes }) })),
     ],
-    // Decrypt for a wallet that proves (signature) it is the business, or the creature's Arkiv owner.
+    // Listing attestation for CreatureMarket.list: the settler checks ownership, redemption, the Arkiv
+    // escrow and the entity's data against the chain, then signs.
+    [
+      "POST",
+      /^\/api\/market\/attest$/,
+      async (_req, _m, body) => arkivCall(() => settler.attestListing({ creatureId: body?.creatureId, seller: body?.seller, price: body?.price })),
+    ],
+    // Decrypt for a wallet that proves (signature) it is the business, or the creature's owner after redeeming.
     [
       "POST",
       /^\/api\/campaigns\/(\d+)\/discount-codes\/reveal$/,
@@ -208,7 +246,7 @@ export function createApi({ config, chain, swarm, state, service, codes, logger 
       return await fn();
     } catch (err) {
       if (err instanceof NotAllocatedError || err instanceof NotReadyError) throw new HttpError(409, err.message);
-      if (err instanceof CodeAccessError) throw new HttpError(err.status, err.message);
+      if (err instanceof CodeAccessError || err instanceof SettlerRequestError) throw new HttpError(err.status, err.message);
       if (err instanceof TypeError) throw new HttpError(400, err.message);
       throw err;
     }

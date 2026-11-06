@@ -14,7 +14,8 @@
     "test": "node --test \"test/*.test.js\"",
     "e2e": "node e2e/local.e2e.js",
     "demo": "node scripts/demo-campaign.js",
-    "gen-code-key": "node scripts/generate-code-key.js"
+    "gen-code-key": "node scripts/generate-code-key.js",
+    "gen-key": "node scripts/generate-key.js"
   },
   "dependencies": {
     "@arkiv-network/sdk": "1.0.1",

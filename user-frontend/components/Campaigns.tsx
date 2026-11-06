@@ -1,33 +1,41 @@
 "use client";
 
-// Spawns from Arkiv (one per campaign within 1 km that canSpawnFor allows): map markers + 3D models at the
-// exact spot the business placed them, the encounter card, the AR camera and the on-chain catch flow.
+// Spawns (lib/creatures.ts loadSpawns): Arkiv creature entities near the player, each verified on chain and
+// shown as its campaign's NEXT creature on CreatureMarket, one per business within 500 m. Map markers + 3D
+// models at the campaign's spawn point, the encounter card, the AR camera and the claim flow:
+//   claim ticket (this app's server, World ID) -> CreatureMarket.claim (MetaMask) -> Arkiv entity -> player.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import mapboxgl from "mapbox-gl";
-import type { Address } from "viem";
-import { fetchCreaturesNear, type Creature } from "@/lib/arkiv";
-import { CATCH_RADIUS, VISIBLE_RADIUS, visibleCampaigns, type Campaign } from "@/lib/campaigns";
-import { RARITIES, catchCreature, chainConfigured, spawnableCampaigns, type CatchPhase, type Caught } from "@/lib/chain";
+import type { Address, Hex } from "viem";
+import { CATCH_RADIUS, VISIBLE_RADIUS, toCampaign, type Campaign } from "@/lib/campaigns";
+import { postJson } from "@/lib/codes";
+import { loadConfig, type AppConfig } from "@/lib/config";
+import { loadSpawns, waitForArkivOwner, type MapSpawn } from "@/lib/creatures";
+import { distanceM, toE6, withinClaimRadius } from "@/lib/geo";
+import { claim } from "@/lib/market";
+import { errorText } from "@/lib/metamask";
 import { createCampaignModels } from "@/lib/campaignModels";
 import type { Player } from "@/lib/player";
 import type { Occlusion } from "@/lib/occlusion";
 import type { ARCatchOutcome } from "@/components/ARView";
-import CatchProgress from "@/components/CatchProgress";
+import CatchProgress, { type CatchPhase } from "@/components/CatchProgress";
 import CatchReveal, { type Reveal } from "@/components/CatchReveal";
 import { IconCamera, IconChevronSwap, IconPaw } from "@/components/icons";
 
 // Camera AR. Browser only.
 const ARView = dynamic(() => import("@/components/ARView"), { ssr: false });
 
-const REFETCH_MOVE = 300; // m — refetch when the player is this far from the last fetch centre
-const REFETCH_EVERY = 60_000; // ms
+const REFETCH_MOVE = 75; // m — refetch when the player is this far from the last fetch centre
+const REFETCH_EVERY = 30_000; // ms — someone else may have claimed the next creature
 const RETRY_AFTER = 15_000; // ms — back-off after a failed load (rate limits)
-const FETCH_RADIUS = VISIBLE_RADIUS + REFETCH_MOVE; // covers the 1 km circle until the next refetch
 const MARKER_LIFT = -72; // px — the label floats above the hovering 3D model
 
-const BUSY: CatchPhase[] = ["clearing", "confirm", "verifying", "rolling"];
+const BUSY: CatchPhase[] = ["ticket", "confirm", "mining"];
+
+/** Distance with CreatureMarket's own formula (lib/geo.ts), so "in range" means the contract will accept it. */
+const contractDist = (a: mapboxgl.LngLat, s: MapSpawn) => distanceM(toE6(a.lat), toE6(a.lng), s.latitudeE6, s.longitudeE6);
 
 export const fmtDist = (m: number) => (m < 1000 ? `${Math.max(0, Math.round(m))} m` : `${(m / 1000).toFixed(1)} km`);
 
@@ -53,8 +61,8 @@ export default function Campaigns({
 }) {
   const getPlayerPos = player.getPosition;
   const [pos, setPos] = useState(getPlayerPos);
-  const [creatures, setCreatures] = useState<Creature[]>([]);
-  const [spawnable, setSpawnable] = useState<Set<string>>(new Set());
+  const [cfg, setCfg] = useState<AppConfig | null>(null);
+  const [spawns, setSpawns] = useState<MapSpawn[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -63,6 +71,11 @@ export default function Campaigns({
   const [catchTarget, setCatchTarget] = useState<string>("");
   const [result, setResult] = useState<Reveal | null>(null);
   const busy = phase !== null && BUSY.includes(phase);
+
+  // Deployment config (contract addresses, Arkiv network) from this app's server.
+  useEffect(() => {
+    loadConfig().then(setCfg, (e) => setLoadError(errorText(e)));
+  }, []);
 
   // Follow the player (GPS or dev-mode walking) without re-rendering on every frame.
   useEffect(() => {
@@ -73,26 +86,24 @@ export default function Campaigns({
     return () => clearInterval(t);
   }, [getPlayerPos]);
 
-  // Load creatures around the player; refetch after moving far or every minute.
+  // Load creatures around the player; refetch after moving, and periodically (the next creature changes
+  // whenever someone claims one).
   const fetchedAt = useRef<mapboxgl.LngLat | null>(null);
   // One load at a time, and after a failure wait RETRY_AFTER: the position ticks every 500 ms, and retrying
   // on each tick floods the public RPCs, which answer with 429s (that also break an in-flight catch).
   const loading = useRef(false);
   const retryAt = useRef(0);
   const load = useCallback(
-    async (at: mapboxgl.LngLat) => {
-      if (loading.current || Date.now() < retryAt.current) return;
+    async (at: mapboxgl.LngLat, force = false) => {
+      if (!cfg || loading.current || (!force && Date.now() < retryAt.current)) return;
       loading.current = true;
       fetchedAt.current = at;
       try {
-        if (!chainConfigured) throw new Error("NEXT_PUBLIC_CATCH_MANAGER is not set");
-        const list = await fetchCreaturesNear(at.lat, at.lng, FETCH_RADIUS);
-        setSpawnable(await spawnableCampaigns(wallet as Address, [...new Set(list.map((c) => c.campaignId))]));
-        setCreatures(list);
+        setSpawns(await loadSpawns(cfg, wallet as Address, at.lat, at.lng));
         setLoadError("");
         setLoaded(true);
       } catch (err) {
-        console.warn("Arkiv fetch failed", err);
+        console.warn("Loading creatures failed", err);
         setLoadError("Couldn't reach the creature network. Retrying shortly…");
         fetchedAt.current = null; // retry on the first tick after the back-off
         retryAt.current = Date.now() + RETRY_AFTER;
@@ -100,7 +111,7 @@ export default function Campaigns({
         loading.current = false;
       }
     },
-    [wallet],
+    [cfg, wallet],
   );
 
   useEffect(() => {
@@ -112,8 +123,10 @@ export default function Campaigns({
     return () => clearInterval(t);
   }, [load, getPlayerPos]);
 
-  const campaigns = useMemo(() => visibleCampaigns(creatures, spawnable, pos), [creatures, spawnable, pos]);
-  const dist = useCallback((c: { lngLat: mapboxgl.LngLat }) => c.lngLat.distanceTo(pos), [pos]);
+  // Spawns were picked around the last fetch point; keep only those still within reach of where we are now.
+  const allCampaigns = useMemo(() => spawns.map(toCampaign), [spawns]);
+  const campaigns = useMemo(() => allCampaigns.filter((c) => contractDist(pos, c.spawn) <= VISIBLE_RADIUS), [allCampaigns, pos]);
+  const dist = useCallback((c: Campaign) => contractDist(pos, c.spawn), [pos]);
   const sorted = useMemo(() => [...campaigns].sort((a, b) => dist(a) - dist(b)), [campaigns, dist]);
   // Tapped marker if it's still on the map, otherwise the nearest campaign.
   const selected = campaigns.find((c) => c.id === selectedId) ?? sorted[0] ?? null;
@@ -185,33 +198,59 @@ export default function Campaigns({
     };
   }, []);
 
-  /** The on-chain catch. Shared by the map's Catch button and a tap on a creature in the AR camera. */
+  /**
+   * The claim. Shared by the map's Catch button and a tap on a creature in the AR camera.
+   * CreatureMarket.claim re-checks everything (ticket, 50 m, next creature, one per campaign, expiry); the
+   * transaction is simulated first, so a revert reason shows before MetaMask opens.
+   */
   const catchAt = async (target: Campaign): Promise<ARCatchOutcome> => {
-    if (busy) return "failed";
+    if (busy || !cfg) return "failed";
+    const s = target.spawn;
     setCatchError("");
     setCatchTarget(target.businessName);
     setSelectedId(target.id);
-    const at = player.getFix(); // CRE checks the real position against the campaign's on-chain spawn point
+    const at = player.getFix(); // the contract checks this real position against the campaign's spawn point
+    const latE6 = toE6(at.lat);
+    const lonE6 = toE6(at.lng);
     try {
-      const caught: Caught | null = await catchCreature(wallet as Address, target.campaignId, at.lat, at.lng, setPhase);
-      if (!caught) return "missed";
-      const own = target.creatures.find((c) => c.creatureId === caught.creatureId.toString());
+      if (!withinClaimRadius(latE6, lonE6, s.latitudeE6, s.longitudeE6)) {
+        throw new Error(`You are ${Math.round(contractDist(at, s))} m away: get within ${CATCH_RADIUS} m of the creature.`);
+      }
+      setPhase("ticket");
+      const ticket = await postJson<{ deadline: string; signature: Hex }>("/api/claim-ticket", { creatureId: s.nextCreatureId });
+      setPhase("confirm");
+      await claim(
+        cfg,
+        wallet as Address,
+        { creatureId: BigInt(s.nextCreatureId), latE6, lonE6, deadline: BigInt(ticket.deadline), signature: ticket.signature },
+        () => setPhase("mining"),
+      );
       navigator.vibrate?.([60, 40, 120]);
       setResult({
-        creatureId: caught.creatureId,
-        rarity: RARITIES[caught.rarity] ?? "COMMON",
-        float: caught.float,
+        creatureId: BigInt(s.nextCreatureId),
+        rarity: s.rarity,
         businessName: target.businessName,
         description: target.discountDescription,
-        modelUrl: own?.modelUrl ?? target.modelUrl,
+        modelUrl: target.modelUrl,
+        arkiv: s.mode === "approval" ? "approval" : "transferring",
+        entityKey: s.entity.key,
       });
       setPhase(null);
       setSelectedId(null);
-      void load(getPlayerPos()); // canSpawnFor is now false for this campaign
+      void load(getPlayerPos(), true); // this campaign leaves the map (one creature per player per campaign)
+      if (s.mode === "auto") {
+        // The settler moves the Arkiv entity to the player once it sees the claim.
+        void waitForArkivOwner(cfg, s.nextCreatureId, wallet as Address).then((moved) =>
+          setResult((r) => (r && r.creatureId === BigInt(s.nextCreatureId) ? { ...r, arkiv: moved ? "arrived" : "pending" } : r)),
+        );
+      }
       return "caught";
     } catch (err) {
       setPhase(null);
-      setCatchError(err instanceof Error ? err.message.split("\n")[0] : "Catch failed.");
+      const msg = errorText(err);
+      setCatchError(msg);
+      // Someone else claimed it / the campaign changed: refresh what the map shows.
+      if (/claimed this creature|already have|been claimed|ended|not active/.test(msg)) void load(getPlayerPos(), true);
       return "failed";
     }
   };
@@ -245,10 +284,7 @@ export default function Campaigns({
           ) : (
             <div className="scan panel" aria-live="polite">
               <span className="scan-radar" aria-hidden="true" />
-              <span>
-                <strong>{loadError ? "Connection trouble" : loaded ? "No creatures nearby" : "Scanning the area…"}</strong>
-                {loadError || (loaded ? `Nothing within ${VISIBLE_RADIUS / 1000} km yet. Keep exploring: new spawns appear as you move.` : "Looking for creatures within 1 km.")}
-              </span>
+              <strong>{loadError ? "Connection trouble…" : loaded ? "No creatures nearby" : "Scanning…"}</strong>
             </div>
           )}
         </div>
@@ -293,35 +329,29 @@ function Encounter({
   const closeness = Math.min(1, Math.max(0.06, 1 - (distance - CATCH_RADIUS) / (VISIBLE_RADIUS - CATCH_RADIUS)));
   return (
     <section className="encounter panel" data-in-range={inRange} aria-live="polite" aria-label="Nearest creature">
-      <div className="encounter-head">
-        <span className="encounter-badge">
-          <IconPaw />
+      <span className="encounter-badge" aria-hidden="true">
+        <IconPaw />
+      </span>
+      <div className="encounter-title">
+        <strong>{campaign.businessName}</strong>
+        <span className="num">{inRange ? "In range · tap Catch" : `${fmtDist(distance)} away`}</span>
+        <span className="encounter-progress" aria-hidden="true">
+          <span style={{ width: `${closeness * 100}%` }} />
         </span>
-        <div className="encounter-title">
-          <strong>{campaign.businessName}</strong>
-          <span>{campaign.discountDescription}</span>
-        </div>
       </div>
-      <div className="encounter-label">{inRange ? "Creature in range!" : "Get closer to catch:"}</div>
-      <div className="encounter-progress" role="meter" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(closeness * 100)} aria-label="Distance to the creature">
-        <span style={{ width: `${closeness * 100}%` }} />
-        <b className="num">{inRange ? `${fmtDist(distance)} away` : `${fmtDist(distance - CATCH_RADIUS)} to go`}</b>
-      </div>
-      <div className="encounter-switch">
-        {count > 1 && (
-          <button type="button" className="icon-btn icon-btn-stone" aria-label="Next creature" onClick={onCycle}>
-            <IconChevronSwap />
-          </button>
-        )}
-        <button type="button" className="btn btn-primary btn-lg" disabled={!inRange} onClick={onCatch}>
-          {inRange ? "Catch!" : "Too far"}
+      {count > 1 && (
+        <button type="button" className="icon-btn icon-btn-stone encounter-mini" aria-label="Next creature" onClick={onCycle}>
+          <IconChevronSwap />
         </button>
-        {onAR && (
-          <button type="button" className="icon-btn" aria-label="Find it in AR" onClick={onAR}>
-            <IconCamera />
-          </button>
-        )}
-      </div>
+      )}
+      {onAR && (
+        <button type="button" className="icon-btn encounter-mini" aria-label="Find it in AR" onClick={onAR}>
+          <IconCamera />
+        </button>
+      )}
+      <button type="button" className="btn btn-primary encounter-catch" disabled={!inRange} onClick={onCatch} title={campaign.discountDescription}>
+        {inRange ? "Catch!" : "Far"}
+      </button>
     </section>
   );
 }

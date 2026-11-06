@@ -1,107 +1,178 @@
 "use client";
 
-// The player's profile and collection in one place: every creature this wallet owns on chain (catches +
-// bought ones) with its Arkiv data.
-//   Ready (unredeemed, unlisted) -> Redeem reward (CRE reveals the code sealed to this wallet's key) or List on market
-//   Redeemed                     -> Show code again (sign only, no tx)
-//   Listed                       -> View on market, or Unlist (back to Redeem / List)
+// The player's profile and collection in one place: every creature this wallet holds (Arkiv entities they own,
+// cross-checked on CreatureMarket), plus their listings and claims still on their way (lib/creatures.ts).
+//   Ready     Redeem: CreatureMarket.redeem (final; blocks selling) -> the worker reveals the code to the owner
+//             -> Arkiv redeemed = true.   Sell: Arkiv escrow (listed = true, price, ownership -> settler) ->
+//             settler attestation -> CreatureMarket.list
+//   Redeemed  Show code (sign only, no transaction)
+//   For sale  Unlist: CreatureMarket.unlist -> the settler hands the entity back automatically
+//   Escrow    Finish listing (attestation + CreatureMarket.list at the escrowed price)
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { isAddressEqual, type Address } from "viem";
-import * as arkiv from "@/lib/arkiv";
-import { creatureRows, entitiesOwnedBy, listCreature, listedSellers, markRedeemed } from "@/lib/arkiv";
-import { RARITIES, chainConfigured, ownedCreatures, redeem, type RedeemPhase } from "@/lib/chain";
+import { formatEther, parseEther, type Address, type Hex } from "viem";
+import { escrowForSale, explorerUrl, markRedeemed, modelUrl } from "@/lib/arkiv";
+import { postJson, revealCode } from "@/lib/codes";
+import { loadConfig, type AppConfig } from "@/lib/config";
+import { loadProfile, type ProfileItem } from "@/lib/creatures";
+import { list, redeem, unlist } from "@/lib/market";
+import { errorText } from "@/lib/metamask";
 import Avatar, { shortAddr } from "@/components/Avatar";
-import CreatureCard, { RARITY_ORDER, titleCase } from "@/components/CreatureCard";
+import CreatureCard, { RARITY_ORDER } from "@/components/CreatureCard";
 import { IconAlert, IconCheck, IconClose, IconCopy, IconGift, IconMap, IconPaw, IconShield, IconTag } from "@/components/icons";
 
-// The Arkiv side of unlisting lives in lib/arkiv.ts (`unlistCreature(owner, creatureId)`, same shape as
-// listCreature). Looked up at runtime so the page still builds and runs before that code is merged.
-type Unlist = (owner: Address, creatureId: bigint) => Promise<unknown>;
-const unlistCreature: Unlist = (owner, creatureId) => {
-  const fn = (arkiv as unknown as { unlistCreature?: Unlist }).unlistCreature;
-  if (!fn) return Promise.reject(new Error("Unlisting isn't available yet: lib/arkiv.ts has no unlistCreature."));
-  return fn(owner, creatureId);
-};
+const MAX_PRICE = (BigInt(1) << BigInt(64)) - BigInt(1); // CreatureMarket.MAX_PRICE (Arkiv u64 column)
+const POLL_MS = 15_000; // while something is in flight (approval, settler transfer, escrow)
 
-// The SDK wraps wallet/RPC failures in a generic message; walk the cause chain to show the real reason.
-type Err = { code?: number; message?: string; shortMessage?: string; details?: string; cause?: unknown };
-const HINT: Record<number, string> = {
-  4001: "You rejected the request in your wallet.",
-  4100: "Connect this account to the site on the Rabdi network in MetaMask.",
-  [-32002]: "A MetaMask request is already open. Open MetaMask, approve or reject it, then try again.",
-};
-const errMsg = (e: unknown) => {
-  console.warn(e); // warn, not error: console.error pops the Next.js dev overlay
-  const msgs: string[] = [];
-  for (let x = e as Err | undefined; x && typeof x === "object"; x = x.cause as Err | undefined) {
-    if (x.code !== undefined && HINT[x.code]) return HINT[x.code];
-    msgs.push(x.details ?? x.shortMessage ?? x.message?.split("\n")[0] ?? (x.code !== undefined ? `code ${x.code}` : ""));
+function parsePrice(text: string): bigint {
+  let wei: bigint;
+  try {
+    wei = parseEther(text.trim());
+  } catch {
+    throw new Error("Enter a price in ETH, e.g. 0.01");
   }
-  return [...new Set(msgs.filter(Boolean))].join(" ← ") || String(e);
-};
-
-const PHASE: Record<RedeemPhase, string> = {
-  sign: "Sign to unlock…",
-  confirm: "Confirm in wallet…",
-  verifying: "Verifying ownership…",
-};
-
-async function fetchItems(player: Address) {
-  const bought = await entitiesOwnedBy(player).then((es) => es.map((e) => e.creatureId)).catch(() => []);
-  const owned = await ownedCreatures(player, bought);
-  const [rows, sellers] = await Promise.all([creatureRows(owned.map((c) => c.creatureId)), listedSellers()]);
-  return owned
-    .map((c) => {
-      const seller = sellers.get(c.creatureId.toString());
-      const row = rows.get(c.creatureId.toString());
-      return { c, row, rarity: row?.rarity ?? RARITIES[c.rarity] ?? "COMMON", listed: !!seller && isAddressEqual(seller, player) && !c.redeemed };
-    })
-    .sort((a, b) => RARITY_ORDER.indexOf(b.rarity) - RARITY_ORDER.indexOf(a.rarity) || b.c.float - a.c.float);
+  if (wei <= BigInt(0)) throw new Error("The price must be above 0");
+  if (wei > MAX_PRICE) throw new Error(`The maximum price is ${formatEther(MAX_PRICE)} ETH`);
+  return wei;
 }
-type Item = Awaited<ReturnType<typeof fetchItems>>[number];
 
-type Filter = "all" | "ready" | "redeemed" | "listed";
-const FILTERS: { id: Filter; label: string; test: (i: Item) => boolean }[] = [
+const STATUS: Record<ProfileItem["status"], string> = {
+  owned: "",
+  listed: "For sale",
+  escrow: "Listing…",
+  "awaiting-approval": "Awaiting approval",
+  transferring: "Arriving",
+};
+
+type Filter = "all" | "ready" | "redeemed" | "listed" | "arriving";
+const isReady = (i: ProfileItem) => i.status === "owned" && !i.holding.redeemed;
+const FILTERS: { id: Filter; label: string; test: (i: ProfileItem) => boolean }[] = [
   { id: "all", label: "All", test: () => true },
-  { id: "ready", label: "Ready to redeem", test: (i) => !i.c.redeemed && !i.listed },
-  { id: "redeemed", label: "Redeemed", test: (i) => i.c.redeemed },
-  { id: "listed", label: "Listed", test: (i) => i.listed },
+  { id: "ready", label: "Ready to redeem", test: isReady },
+  { id: "redeemed", label: "Redeemed", test: (i) => i.holding.redeemed },
+  { id: "listed", label: "For sale", test: (i) => i.status === "listed" || i.status === "escrow" },
+  { id: "arriving", label: "Arriving", test: (i) => i.status === "awaiting-approval" || i.status === "transferring" },
 ];
 
 export default function MyCreatures({ wallet }: { wallet: string }) {
   const player = wallet as Address;
-  const [items, setItems] = useState<Item[] | null>(null);
+  const [cfg, setCfg] = useState<AppConfig | null>(null);
+  const [items, setItems] = useState<ProfileItem[] | null>(null);
   const [filter, setFilter] = useState<Filter>("all");
-  const [busy, setBusy] = useState<{ id: string; label: string } | null>(null);
+  const [busy, setBusy] = useState(""); // "<creatureId>:<action>"
+  const [note, setNote] = useState("");
+  const [error, setError] = useState("");
   const [codes, setCodes] = useState<Record<string, string>>({});
   const [copied, setCopied] = useState("");
-  const [error, setError] = useState("");
+  const [selling, setSelling] = useState<string | null>(null);
+  const [prices, setPrices] = useState<Record<string, string>>({});
 
-  const load = useCallback(() => fetchItems(player).then(setItems, (e) => setError(errMsg(e))), [player]);
+  const refresh = useCallback(
+    async (c: AppConfig) => {
+      try {
+        setItems(await loadProfile(c, player));
+        setError("");
+      } catch (e) {
+        setError(errorText(e));
+      }
+    },
+    [player],
+  );
+
   useEffect(() => {
-    if (!chainConfigured) return;
-    fetchItems(player).then(setItems, (e) => setError(errMsg(e)));
-  }, [player]);
+    loadConfig().then(
+      (c) => {
+        setCfg(c);
+        void refresh(c);
+      },
+      (e) => setError(errorText(e)),
+    );
+  }, [refresh]);
 
-  const run = async (id: string, label: string, fn: () => Promise<unknown>) => {
+  // Transfers done by the settler / the business show up without a reload.
+  useEffect(() => {
+    if (!cfg || !items?.some((i) => i.status !== "owned" && i.status !== "listed")) return;
+    const t = setInterval(() => void refresh(cfg), POLL_MS);
+    return () => clearInterval(t);
+  }, [cfg, items, refresh]);
+
+  const run = async (id: string, action: string, fn: (c: AppConfig) => Promise<void>) => {
+    if (!cfg || busy) return;
     setError("");
-    setBusy({ id, label });
+    setNote("");
+    setBusy(`${id}:${action}`);
     try {
-      await fn();
-      await load();
+      await fn(cfg);
     } catch (e) {
-      setError(errMsg(e));
+      setNote("");
+      setError(errorText(e));
+    } finally {
+      setBusy("");
+      void refresh(cfg);
     }
-    setBusy(null);
   };
 
-  const reveal = (id: string, c: Item["c"], mirror: boolean) =>
-    run(id, "Preparing…", async () => {
-      const code = await redeem(player, c.creatureId, (phase) => setBusy({ id, label: PHASE[phase] }));
-      setCodes((m) => ({ ...m, [id]: code }));
-      if (mirror) await markRedeemed(player, c.creatureId).catch(() => null); // Arkiv display mirror, best effort
+  const doRedeem = (it: ProfileItem) =>
+    run(it.creatureId, "redeem", async (c) => {
+      if (!confirm("Redeem this creature? Its discount code is revealed, and a redeemed creature can never be sold.")) return;
+      if (!it.holding.redeemed) {
+        setNote("Confirm the redemption in MetaMask…");
+        await redeem(c, player, BigInt(it.creatureId), () => setNote("Redeeming on chain…"));
+      }
+      setNote("Sign the reveal request (free, no transaction)…");
+      const code = await revealCode(c, player, it.creatureId);
+      setCodes((m) => ({ ...m, [it.creatureId]: code }));
+      setNote("Redeemed ✓ Mirroring it on Arkiv (redeemed = true): confirm in MetaMask…");
+      await markRedeemed(c, player, it.entity.key);
+      setNote("Redeemed ✓ Arkiv updated.");
+    });
+
+  const showCode = (it: ProfileItem) =>
+    run(it.creatureId, "code", async (c) => {
+      setNote("Sign the reveal request (free, no transaction)…");
+      const code = await revealCode(c, player, it.creatureId);
+      setCodes((m) => ({ ...m, [it.creatureId]: code }));
+      setNote("");
+    });
+
+  const syncRedeemed = (it: ProfileItem) =>
+    run(it.creatureId, "sync", async (c) => {
+      setNote("Mirror the redemption on Arkiv: confirm in MetaMask…");
+      await markRedeemed(c, player, it.entity.key);
+      setNote("Arkiv updated: redeemed = true.");
+    });
+
+  /** Attestation from the settler (ownership, not redeemed, untampered data), then the on-chain listing. */
+  const finishListing = async (c: AppConfig, creatureId: string, price: bigint) => {
+    setNote("Checking the creature (ownership, redemption, untampered data)…");
+    const att = await postJson<{ deadline: string; signature: Hex }>("/api/market/attest", { creatureId, price: price.toString() });
+    setNote("Confirm the listing in MetaMask…");
+    await list(c, player, { creatureId: BigInt(creatureId), price, deadline: BigInt(att.deadline), signature: att.signature }, () => setNote("Listing on chain…"));
+    setNote(`Listed for ${formatEther(price)} ETH ✓ It's on the marketplace.`);
+    setSelling(null);
+  };
+
+  const doSell = (it: ProfileItem) =>
+    run(it.creatureId, "sell", async (c) => {
+      const price = parsePrice(prices[it.creatureId] ?? "");
+      if (it.holding.redeemed) throw new Error("A redeemed creature cannot be sold.");
+      setNote("Move it to the marketplace escrow on Arkiv: confirm in MetaMask…");
+      await escrowForSale(c, player, it.entity.key, price);
+      await finishListing(c, it.creatureId, price);
+    });
+
+  const doFinish = (it: ProfileItem) =>
+    run(it.creatureId, "finish", async (c) => {
+      if (it.entity.price === null) throw new Error("The escrow has no price; wait for it to return, then sell again.");
+      await finishListing(c, it.creatureId, it.entity.price);
+    });
+
+  const doUnlist = (it: ProfileItem) =>
+    run(it.creatureId, "unlist", async (c) => {
+      setNote("Confirm in MetaMask…");
+      await unlist(c, player, BigInt(it.creatureId), () => setNote("Unlisting on chain…"));
+      setNote("Unlisted ✓ The creature returns to you on Arkiv in a moment.");
     });
 
   const copy = (id: string, code: string) =>
@@ -114,7 +185,15 @@ export default function MyCreatures({ wallet }: { wallet: string }) {
       .catch(() => null);
 
   const counts = useMemo(() => Object.fromEntries(FILTERS.map((f) => [f.id, items?.filter(f.test).length ?? 0])) as Record<Filter, number>, [items]);
-  const shown = items?.filter(FILTERS.find((f) => f.id === filter)!.test) ?? [];
+  const shown = useMemo(
+    () =>
+      (items ?? [])
+        .filter(FILTERS.find((f) => f.id === filter)!.test)
+        .sort((a, b) => RARITY_ORDER.indexOf(b.entity.rarity) - RARITY_ORDER.indexOf(a.entity.rarity) || Number(b.holding.claimedAt - a.holding.claimedAt)),
+    [items, filter],
+  );
+
+  const spin = (id: string, action: string) => busy === `${id}:${action}`;
 
   return (
     <>
@@ -151,7 +230,7 @@ export default function MyCreatures({ wallet }: { wallet: string }) {
 
       <div className="toolbar">
         <div className="filters" role="group" aria-label="Filter creatures">
-          {FILTERS.map((f) => (
+          {FILTERS.filter((f) => f.id !== "arriving" || counts.arriving > 0).map((f) => (
             <button key={f.id} type="button" aria-pressed={filter === f.id} onClick={() => setFilter(f.id)}>
               {f.label}
               <span className="count">{items ? counts[f.id] : ""}</span>
@@ -160,14 +239,20 @@ export default function MyCreatures({ wallet }: { wallet: string }) {
         </div>
       </div>
 
-      {(error || !chainConfigured) && (
-        <div className="notice notice-error" style={{ marginBottom: 16 }} role="status">
+      {note && (
+        <div className="notice" style={{ marginBottom: 16 }} role="status" aria-live="polite">
+          {busy ? <span className="spinner" aria-hidden="true" /> : <IconCheck />}
+          <span>{note}</span>
+        </div>
+      )}
+      {error && (
+        <div className="notice notice-error" style={{ marginBottom: 16 }} role="alert">
           <IconAlert />
-          <span>{!chainConfigured ? "Set NEXT_PUBLIC_CATCH_MANAGER to load your creatures." : error}</span>
+          <span>{error}</span>
         </div>
       )}
 
-      {!items && chainConfigured && !error && (
+      {!items && !error && (
         <div className="grid" aria-busy="true" aria-label="Loading creatures">
           {[0, 1, 2].map((i) => (
             <div key={i} className="skeleton" />
@@ -183,7 +268,7 @@ export default function MyCreatures({ wallet }: { wallet: string }) {
           <h3>{filter === "all" ? "No creatures yet" : "Nothing here"}</h3>
           <p>
             {filter === "all"
-              ? "Head out on the map, walk within 100 m of a spawn and catch your first creature. Every catch carries a real reward."
+              ? "Head out on the map, walk within 50 m of a spawn and catch your first creature. Every catch carries a real reward."
               : "No creatures match this filter."}
           </p>
           {filter === "all" && (
@@ -197,34 +282,43 @@ export default function MyCreatures({ wallet }: { wallet: string }) {
 
       {shown.length > 0 && (
         <div className="grid">
-          {shown.map(({ c, row, rarity, listed }) => {
-            const id = c.creatureId.toString();
-            const here = busy?.id === id;
+          {shown.map((it) => {
+            const id = it.creatureId;
+            const e = it.entity;
             const code = codes[id];
+            const redeemed = it.holding.redeemed;
+            const label = STATUS[it.status];
             return (
               <CreatureCard
                 key={id}
-                rarity={rarity}
-                title={row?.businessName ?? `${titleCase(rarity)} creature`}
-                offer={row?.description}
-                modelUrl={row?.modelUrl}
+                rarity={e.rarity}
+                title={e.businessName}
+                offer={e.discountDescription}
+                modelUrl={modelUrl(e.swarmReference || e.campaignSwarmReference)}
                 status={
-                  c.redeemed ? (
+                  redeemed ? (
                     <span className="status status-ok">
                       <IconCheck />
                       Redeemed
                     </span>
-                  ) : listed ? (
+                  ) : label ? (
                     <span className="status">
-                      <IconTag />
-                      Listed
+                      {it.status === "listed" ? <IconTag /> : <span className="spinner" aria-hidden="true" />}
+                      {label}
                     </span>
                   ) : undefined
                 }
                 facts={[
-                  ["Float", <span key="f" className="mono">{c.float.toFixed(6)}</span>],
-                  ["Creature", `#${(c.creatureId & BigInt(0xffffffff)).toString()}`],
-                  ["Campaign", (c.creatureId >> BigInt(32)).toString()],
+                  ["Creature", `#${e.index}`],
+                  ["Campaign", e.campaignId],
+                  ["Claimed", it.holding.claimedAt > BigInt(0) ? new Date(Number(it.holding.claimedAt) * 1000).toLocaleDateString() : "—"],
+                  ...(it.status === "listed" ? [["Price", <span key="p" className="creature-price">{formatEther(it.listing.price)} ETH</span>] as [string, React.ReactNode]] : []),
+                  [
+                    "Arkiv",
+                    <a key="a" href={explorerUrl(e.key)} target="_blank" rel="noreferrer" className="mono">
+                      {shortAddr(e.key)}
+                    </a>,
+                  ],
                 ]}
               >
                 {code && (
@@ -236,38 +330,85 @@ export default function MyCreatures({ wallet }: { wallet: string }) {
                     </button>
                   </div>
                 )}
-                {!code && (
+
+                {it.status === "owned" && redeemed && !code && (
                   <div className="creature-actions">
-                    {c.redeemed ? (
-                      <button type="button" className="btn btn-secondary" disabled={!!busy} onClick={() => void reveal(id, c, false)}>
-                        {here ? <span className="spinner" /> : <IconGift />}
-                        {here ? busy.label : "Show code"}
+                    <button type="button" className="btn btn-secondary" disabled={!!busy} onClick={() => void showCode(it)}>
+                      {spin(id, "code") ? <span className="spinner" /> : <IconGift />}
+                      {spin(id, "code") ? "Sign…" : "Show code"}
+                    </button>
+                    {!e.redeemed && (
+                      <button type="button" className="btn btn-secondary" disabled={!!busy} onClick={() => void syncRedeemed(it)}>
+                        {spin(id, "sync") ? <span className="spinner" /> : <IconCheck />}
+                        {spin(id, "sync") ? "Updating…" : "Sync Arkiv"}
                       </button>
-                    ) : listed ? (
-                      <>
-                        <Link href="/marketplace" className="btn btn-secondary">
-                          <IconTag />
-                          Market
-                        </Link>
-                        <button type="button" className="btn btn-secondary" disabled={!!busy} onClick={() => void run(id, "unlist", () => unlistCreature(player, c.creatureId))}>
-                          {here && busy.label === "unlist" ? <span className="spinner" /> : <IconClose />}
-                          {here && busy.label === "unlist" ? "Unlisting…" : "Unlist"}
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <button type="button" className="btn btn-primary" disabled={!!busy} onClick={() => void reveal(id, c, true)}>
-                          {here && busy.label !== "list" ? <span className="spinner" /> : <IconGift />}
-                          {here && busy.label !== "list" ? busy.label : "Redeem"}
-                        </button>
-                        <button type="button" className="btn btn-secondary" disabled={!!busy} onClick={() => void run(id, "list", () => listCreature(player, c.creatureId))}>
-                          {here && busy.label === "list" ? <span className="spinner" /> : <IconTag />}
-                          {here && busy.label === "list" ? "Listing…" : "List"}
-                        </button>
-                      </>
                     )}
                   </div>
                 )}
+
+                {it.status === "owned" && !redeemed && selling !== id && (
+                  <div className="creature-actions">
+                    <button type="button" className="btn btn-primary" disabled={!!busy} onClick={() => void doRedeem(it)}>
+                      {spin(id, "redeem") ? <span className="spinner" /> : <IconGift />}
+                      {spin(id, "redeem") ? "Redeeming…" : "Redeem"}
+                    </button>
+                    <button type="button" className="btn btn-secondary" disabled={!!busy} onClick={() => setSelling(id)}>
+                      <IconTag />
+                      Sell
+                    </button>
+                  </div>
+                )}
+
+                {it.status === "owned" && !redeemed && selling === id && (
+                  <div className="sell-form">
+                    <input
+                      className="price-input"
+                      inputMode="decimal"
+                      placeholder="Price in ETH, e.g. 0.01"
+                      value={prices[id] ?? ""}
+                      onChange={(ev) => setPrices((p) => ({ ...p, [id]: ev.target.value }))}
+                      aria-label="Price in ETH"
+                      autoFocus
+                    />
+                    <div className="creature-actions">
+                      <button type="button" className="btn btn-secondary" disabled={!!busy} onClick={() => setSelling(null)} aria-label="Cancel">
+                        <IconClose />
+                      </button>
+                      <button type="button" className="btn btn-primary" disabled={!!busy || !(prices[id] ?? "").trim()} onClick={() => void doSell(it)}>
+                        {spin(id, "sell") ? <span className="spinner" /> : <IconTag />}
+                        {spin(id, "sell") ? "Listing…" : "List it"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {it.status === "listed" && (
+                  <div className="creature-actions">
+                    <Link href="/marketplace" className="btn btn-secondary">
+                      <IconTag />
+                      Market
+                    </Link>
+                    <button type="button" className="btn btn-secondary" disabled={!!busy} onClick={() => void doUnlist(it)}>
+                      {spin(id, "unlist") ? <span className="spinner" /> : <IconClose />}
+                      {spin(id, "unlist") ? "Unlisting…" : "Unlist"}
+                    </button>
+                  </div>
+                )}
+
+                {it.status === "escrow" && (
+                  <>
+                    <p className="creature-note">In the marketplace escrow but not listed on chain yet. Finish the listing, or it returns to you automatically.</p>
+                    <div className="creature-actions">
+                      <button type="button" className="btn btn-primary" disabled={!!busy || e.price === null} onClick={() => void doFinish(it)}>
+                        {spin(id, "finish") ? <span className="spinner" /> : <IconTag />}
+                        {spin(id, "finish") ? "Listing…" : `Finish${e.price !== null ? ` · ${formatEther(e.price)} ETH` : ""}`}
+                      </button>
+                    </div>
+                  </>
+                )}
+
+                {it.status === "awaiting-approval" && <p className="creature-note">Claimed on chain ✓ {e.businessName} approves the Arkiv transfer; then you can redeem or sell it.</p>}
+                {it.status === "transferring" && <p className="creature-note">Claimed on chain ✓ Moving it to you on Arkiv…</p>}
               </CreatureCard>
             );
           })}

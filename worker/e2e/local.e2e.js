@@ -6,31 +6,41 @@
 //   -> listener prepares per-creature Swarm assets -> API plan
 //   -> the BUSINESS signs one Arkiv entity per creature (business-frontend/src/arkivWrite.js, the page's code)
 //   -> verification against the chain, Swarm and Arkiv ($creator = $owner = business); re-plan is empty.
+//   -> CreatureMarket (claim / redeem / marketplace) + the worker's settler:
+//        Auto settle: a valid claim moves the creature to the player automatically; an invalid one moves nothing
+//        Approval: the business approves the claim (business-frontend approveCatches)
+//        Redeem: on chain, then the owner (only) gets the plaintext code; Arkiv redeemed = true
+//        Marketplace: escrow -> settler attestation -> list -> buy -> settler moves it to the buyer; unlist returns it
 //
 // Run:  npm run e2e            (from worker/, needs anvil + forge on PATH, and business-frontend deps installed)
 // Arkiv: real Rabdi testnet by default. The business key must hold tGLM on Rabdi:
 //          E2E_BUSINESS_PRIVATE_KEY=<0x key funded at https://hub.arkiv.network/faucet>
 //        E2E_ARKIV=memory swaps in an in-memory Arkiv double (then Arkiv is NOT really tested) and
 //        additionally injects a partial failure (3 of 10 creatures) to exercise the retry.
+//        E2E_SWARM=memory swaps in an in-memory Swarm double (when the public gateway is down).
+//        Real Arkiv also needs E2E_SETTLER_PRIVATE_KEY (funded with tGLM); player-signed Arkiv writes
+//        (redeemed flag, marketplace escrow) only run with E2E_ARKIV=memory (dev keys hold no tGLM).
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPublicClient, createWalletClient, http, toHex } from "viem";
 import { mnemonicToAccount, privateKeyToAccount } from "viem/accounts";
-import { arkivChainFor, localAccountArkivWallet, writeCreatureBatches } from "../../business-frontend/src/arkivWrite.js";
+import { approveCatches, arkivChainFor, entityKeyPredictor, localAccountArkivWallet, rabdiBatchTxParams, writeCreatureBatches } from "../../business-frontend/src/arkivWrite.js";
 import managerAbi from "../src/abi/CreatureCampaignManager.json" with { type: "json" };
-import { ArkivCreatureStore, expirationFor } from "../src/arkiv.js";
+import { ArkivCreatureStore, creatureSchema, expirationFor } from "../src/arkiv.js";
 import { CampaignArkivService } from "../src/campaignArkiv.js";
 import { CampaignChain, RARITY } from "../src/chain.js";
 import { buildConfig, loadEnvFile, REPO_ROOT } from "../src/config.js";
 import { CodeCipher, DiscountCodeService, isEncryptedCode } from "../src/discountCodes.js";
 import { revealMessage } from "../../shared/discountCodes.js";
+import { u64 } from "@arkiv-network/sdk";
 import { randomBytes } from "node:crypto";
 import { generatePrivateKey } from "viem/accounts";
 import { parseGlb } from "../src/glb.js";
 import { AllocationListener } from "../src/listener.js";
+import { createSettler } from "../src/settlerSetup.js";
 import { createApi } from "../src/server.js";
 import { JsonStateStore } from "../src/state.js";
 import { SwarmService } from "../src/swarm.js";
@@ -90,6 +100,20 @@ async function main() {
   const deployment = JSON.parse(readFileSync(join(REPO_ROOT, "contracts", "deployments", `${CHAIN_ID}.json`), "utf8"));
   log("CreatureCampaignManager", deployment.campaignManager, "| VRF mock", deployment.vrfCoordinator);
 
+  // CreatureMarket (compiled by the forge run above): humanSigner = the user app's claim-ticket key,
+  // settler = the worker's settler key.
+  const SETTLER_KEY = MEMORY ? keyOf(5) : process.env.E2E_SETTLER_PRIVATE_KEY || "";
+  if (!/^0x[0-9a-fA-F]{64}$/.test(SETTLER_KEY)) throw new Error("Real Arkiv needs E2E_SETTLER_PRIVATE_KEY (a test key funded with tGLM), or run with E2E_ARKIV=memory");
+  const settlerAccount = privateKeyToAccount(SETTLER_KEY);
+  const humanSigner = mnemonicToAccount(MNEMONIC, { addressIndex: 3 });
+  const deployer = mnemonicToAccount(MNEMONIC, { addressIndex: 0 });
+  const MARKET = JSON.parse(readFileSync(join(REPO_ROOT, "contracts", "out", "CreatureMarket.sol", "CreatureMarket.json"), "utf8"));
+  const deployerWallet = createWalletClient({ account: deployer, transport: http(RPC), chain: { id: CHAIN_ID, name: "e2e", nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [RPC] } } } });
+  const marketTx = await deployerWallet.deployContract({ abi: MARKET.abi, bytecode: MARKET.bytecode.object, args: [deployment.campaignManager, humanSigner.address, settlerAccount.address, deployer.address] });
+  const marketReceipt = await probe.waitForTransactionReceipt({ hash: marketTx });
+  const marketAddress = marketReceipt.contractAddress;
+  log("CreatureMarket", marketAddress, "| human signer", humanSigner.address, "| settler", settlerAccount.address);
+
   // ------------------------------------------------------------------ worker components (in-process)
   const base = buildConfig();
   const config = {
@@ -102,15 +126,21 @@ async function main() {
     codeEncryptionKey: base.codeEncryptionKey || randomBytes(32).toString("base64"),
     // The test's own model, so the run does not depend on what is in assets/creatures.
     assetsDir: join(REPO_ROOT, "worker", "test", "fixtures"),
+    // Anvil here mines only on transactions, so waiting for confirmation blocks would wait forever.
+    settlement: { ...base.settlement, privateKey: SETTLER_KEY, creatureMarket: marketAddress, startBlock: marketReceipt.blockNumber, retryDelayMs: 500, sweepIntervalMs: 1000, escrowGraceMs: 3000 },
   };
+  config.chain.confirmations = 0n;
   const stateDir = mkdtempSync(join(tmpdir(), "creature-e2e-"));
   cleanup.push(() => rmSync(stateDir, { recursive: true, force: true }));
   const state = new JsonStateStore(join(stateDir, "state.json"));
   const chain = new CampaignChain(config.chain);
-  const swarm = new SwarmService({ ...config.swarm, maxGlbBytes: config.maxGlbBytes });
+  // E2E_SWARM=memory: in-memory Swarm double (for when the public gateway is down); Swarm is then NOT tested.
+  const swarm = process.env.E2E_SWARM === "memory" ? new (await import("../test/fakes.js")).FakeSwarm() : new SwarmService({ ...config.swarm, maxGlbBytes: config.maxGlbBytes });
+  if (process.env.E2E_SWARM === "memory") log("WARNING: E2E_SWARM=memory -> Swarm replaced by an in-memory double");
 
   let arkiv;
   let arkivWallet;
+  let arkivTxParamsFor;
   if (MEMORY) {
     const { MemoryArkiv } = await import("../test/fakes.js");
     arkiv = new MemoryArkiv();
@@ -120,20 +150,26 @@ async function main() {
     arkiv = new ArkivCreatureStore(config.arkiv);
     const arkivChain = arkivChainFor({ network: config.arkiv.network, accessKey: config.arkiv.accessKey, rpcUrl: config.arkiv.rpcUrl || null });
     arkivWallet = localAccountArkivWallet(business, arkivChain);
+    const arkivRpc = createPublicClient({ chain: arkivChain, transport: http() });
+    arkivTxParamsFor = (batch) => rabdiBatchTxParams({ request: (args) => arkivRpc.request(args), account: business, chain: arkivChain, batch });
     const bal = await arkiv.publicClient.getBalance({ address: business.address });
     log(`Arkiv ${config.arkiv.network}: business ${business.address} balance ${bal} wei`);
     if (bal === 0n) throw new Error(`Business ${business.address} has no tGLM. Fund it at https://hub.arkiv.network/faucet`);
   }
 
-  const service = new CampaignArkivService({ chain, swarm, arkiv, state, expirationFor, batchSize: config.arkiv.batchSize });
+  const settlerAddress = settlerAccount.address;
+  const { settler, market } = createSettler({ config, chain, arkiv, state, wallet: MEMORY ? arkiv.walletFor(settlerAddress) : undefined, gasPolicy: !MEMORY, pollIntervalMs: 300 });
+  settler.run();
+  cleanup.push(() => settler.stop());
+  const service = new CampaignArkivService({ chain, swarm, arkiv, state, expirationFor, batchSize: config.arkiv.batchSize, settler: settlerAddress });
   const listener = new AllocationListener({ chain, state, service, pollIntervalMs: 500 });
   const fulfiller = new LocalVrfFulfiller({ chain, coordinator: deployment.vrfCoordinator, privateKey: keyOf(1), delayMs: 500, pollIntervalMs: 500 });
   listener.run();
   fulfiller.run();
   cleanup.push(() => listener.stop(), () => fulfiller.stop());
 
-  const codes = new DiscountCodeService({ chain, arkiv, cipher: new CodeCipher(config.codeEncryptionKey) });
-  const server = createApi({ config, chain, swarm, state, service, codes });
+  const codes = new DiscountCodeService({ chain, market, cipher: new CodeCipher(config.codeEncryptionKey) });
+  const server = createApi({ config, chain, swarm, state, service, codes, arkiv, market, settler, settlerAddress });
   await new Promise((r) => server.listen(0, r));
   cleanup.push(() => server.close());
   const API = `http://127.0.0.1:${server.address().port}`;
@@ -225,8 +261,11 @@ async function main() {
       walletClient: arkivWallet,
       plan: p,
       schemaName: config.arkiv.schemaName,
+      // Real Arkiv: the same explicit gas policy as the page (memory mode has no node to estimate on).
+      txParamsFor: arkivTxParamsFor,
       onBatch: async (r) => {
         if (r.ok) await call(`/api/campaigns/${campaignId}/arkiv/submissions`, { txHash: r.txHash, entries: r.entries });
+        else if (r.sent && r.txHash) await call(`/api/campaigns/${campaignId}/arkiv/submissions`, { txHash: r.txHash, pending: r.creatureIds });
       },
     });
   const verifyUntil = async (want) => {
@@ -240,8 +279,8 @@ async function main() {
   };
 
   if (MEMORY) {
-    // Partial failure: 3 creatures fail, the other 7 land.
-    const failing = plan.payloads.slice(0, 3).map((p) => p.creatureId);
+    // Partial failure: batch 8 fails, so the run stops (arkiv-write-safety): 7 land, 3 are left.
+    const failing = plan.payloads.slice(7).map((p) => p.creatureId);
     failing.forEach((id) => arkiv.failCreatureIds.add(id));
     const first = await signAll(plan);
     assert.equal(first.written, 7);
@@ -328,6 +367,188 @@ async function main() {
   const again = await waitForPlan();
   assert.equal(again.payloads.length, 0, "nothing left to sign: a re-run cannot create duplicates");
   assert.equal((await call(`/api/campaigns/${campaignId}/arkiv/verify`, {})).status, "COMPLETE");
+
+  // ------------------------------------------------------------------ 9. CreatureMarket: claims, settlement, redeem, marketplace
+  const asWallet = (account) => createWalletClient({ account, chain: chain.chain, transport: http(RPC) });
+  const mined = async (hashPromise) => {
+    const receipt = await chain.client.waitForTransactionReceipt({ hash: await hashPromise });
+    assert.equal(receipt.status, "success");
+    return receipt;
+  };
+  const marketCall = async (account, functionName, args, value) => {
+    const { request: rq } = await chain.client.simulateContract({ address: marketAddress, abi: MARKET.abi, functionName, args, account, value });
+    return mined(asWallet(account).writeContract(rq));
+  };
+  const revertName = async (promise) => {
+    try {
+      await promise;
+    } catch (err) {
+      for (let e = err; e; e = e.cause) if (e.data?.errorName) return e.data.errorName;
+      throw err;
+    }
+    throw new Error("expected a revert");
+  };
+  const player = async (i) => {
+    const a = mnemonicToAccount(MNEMONIC, { addressIndex: i });
+    await probe.request({ method: "anvil_setBalance", params: [a.address, "0x56BC75E2D63100000"] });
+    return a;
+  };
+  const domain = { name: "CreatureMarket", version: "1", chainId: CHAIN_ID, verifyingContract: marketAddress };
+  // What the user app's /api/claim-ticket does for a World ID verified player.
+  const ticketFor = async (playerAddress, creatureId) => {
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
+    const signature = await humanSigner.signTypedData({
+      domain,
+      types: { Claim: [{ name: "player", type: "address" }, { name: "creatureId", type: "uint256" }, { name: "deadline", type: "uint256" }] },
+      primaryType: "Claim",
+      message: { player: playerAddress, creatureId, deadline },
+    });
+    return { deadline, signature };
+  };
+  const claimNext = async (account, id, { latE6 = 19076090, lonE6 = 72877426 } = {}) => {
+    const [creatureId] = await chain.client.readContract({ address: marketAddress, abi: MARKET.abi, functionName: "nextCreature", args: [id] });
+    const t = await ticketFor(account.address, creatureId);
+    await marketCall(account, "claim", [creatureId, latE6, lonE6, t.deadline, t.signature]);
+    return creatureId;
+  };
+  const entityOf = async (id, creatureId) =>
+    (await arkiv.findCampaignEntities({ creator: business.address, chainId: CHAIN_ID, contract: deployment.campaignManager, campaignId: id })).get(String(creatureId))?.[0];
+  const fullEntity = async (creatureId) => (await arkiv.findCreatureEntities({ creator: business.address, chainId: CHAIN_ID, contract: deployment.campaignManager, creatureId }))[0];
+  const until = async (fn, what) => {
+    for (let i = 0; i < 80; i++) {
+      if (await fn()) return;
+      await sleep(500);
+    }
+    throw new Error(`timed out waiting for: ${what}`);
+  };
+  const schema = arkiv.schema ?? creatureSchema(config.arkiv.schemaName);
+
+  // ---- Auto settle campaign: launch, the same batches hand every creature to the settler.
+  const autoInput = { ...input, businessName: "E2E Auto Cafe", totalCreatures: 4, rarityCounts: [2, 1, 1, 0] };
+  const { request: req2, result: autoId } = await chain.client.simulateContract({ address: deployment.campaignManager, abi: managerAbi, functionName: "createCampaign", args: [autoInput], account: business });
+  await mined(wallet.writeContract(req2));
+  await until(async () => (await chain.getCampaign(autoId)).statusName === "ALLOCATED", "auto campaign allocation");
+  let autoPlan;
+  await until(async () => (autoPlan = await call(`/api/campaigns/${autoId}/arkiv/plan`, {}).catch(() => null)), "auto campaign plan");
+  assert.equal(autoPlan.settlement.mode, null, "no entities yet: the business chooses");
+  assert.equal(autoPlan.settlement.settler, settlerAddress);
+  const predictKeys = MEMORY ? (count) => arkiv.predictEntityKeys({ owner: business.address, count }) : entityKeyPredictor(http(), arkivChainFor({ network: config.arkiv.network, accessKey: config.arkiv.accessKey }), business.address);
+  const autoRun = await writeCreatureBatches({
+    walletClient: arkivWallet,
+    plan: autoPlan,
+    schemaName: config.arkiv.schemaName,
+    txParamsFor: arkivTxParamsFor,
+    settleTo: settlerAddress,
+    predictKeys,
+    onBatch: async (r) => r.ok && (await call(`/api/campaigns/${autoId}/arkiv/submissions`, { txHash: r.txHash, entries: r.entries })),
+  });
+  assert.equal(autoRun.written, 4);
+  await until(async () => (await call(`/api/campaigns/${autoId}/arkiv/verify`, {})).status === "COMPLETE", "auto campaign COMPLETE");
+  const autoEntities = await arkiv.findCampaignEntities({ creator: business.address, chainId: CHAIN_ID, contract: deployment.campaignManager, campaignId: autoId });
+  assert.ok([...autoEntities.values()].flat().every((e) => e.owner === settlerAddress), "auto settle: $owner = settler, $creator = business");
+  log(`auto-settle campaign #${autoId}: 4 creatures created by the business, held by settler ${settlerAddress}`);
+
+  // Valid claim (within 50 m, the campaign's next creature) -> the player gets it on Arkiv automatically.
+  const alice = await player(6);
+  const aliceId = await claimNext(alice, autoId, { latE6: 19076090 + 300 }); // ~33 m north of the spawn
+  await until(async () => (await entityOf(autoId, aliceId))?.owner === alice.address, "automatic transfer to the player");
+  assert.equal((await fullEntity(aliceId)).values.catched, true, "catched = true");
+  const autoView = await call(`/api/campaigns/${autoId}`);
+  assert.equal(autoView.settlement.mode, "auto");
+  assert.deepEqual(autoView.settlement.autoSettled.map((x) => [x.creatureId, x.player]), [[String(aliceId), alice.address]], "business notification feed");
+  log(`valid claim: creature ${aliceId} transferred to ${alice.address} automatically (business notified)`);
+
+  // Invalid claims are refused on chain and move nothing.
+  const bob = await player(7);
+  const [nextId] = await chain.client.readContract({ address: marketAddress, abi: MARKET.abi, functionName: "nextCreature", args: [autoId] });
+  const far = await ticketFor(bob.address, nextId);
+  assert.equal(await revertName(marketCall(bob, "claim", [nextId, 19076090 + 600, 72877426, far.deadline, far.signature])), "TooFar", "67 m away");
+  assert.equal(await revertName(claimNext(alice, autoId)), "AlreadyClaimedInCampaign", "one creature per campaign");
+  const forged = await ticketFor(bob.address, nextId);
+  assert.equal(await revertName(marketCall(alice, "claim", [nextId, 19076090, 72877426, forged.deadline, forged.signature])), "InvalidTicket", "a ticket is bound to its player");
+  await sleep(1500);
+  const afterInvalid = await arkiv.findCampaignEntities({ creator: business.address, chainId: CHAIN_ID, contract: deployment.campaignManager, campaignId: autoId });
+  assert.equal([...afterInvalid.values()].flat().filter((e) => e.owner === settlerAddress).length, 3, "invalid claims: nothing transferred");
+  log("invalid claims (too far, second claim, foreign ticket): refused on chain, no ownership transfer");
+
+  // ---- Approval campaign (#1): the claim waits for the business, which approves it.
+  const carol = await player(8);
+  const carolId = await claimNext(carol, campaignId);
+  let approvals;
+  await until(async () => (approvals = (await call(`/api/campaigns/${campaignId}`)).settlement.approvals).length === 1, "claim listed for approval");
+  assert.equal(approvals[0].creatureId, String(carolId));
+  assert.equal(approvals[0].player, carol.address);
+  assert.equal((await entityOf(campaignId, carolId)).owner, business.address, "approval: the settler never moves it");
+  const approved = await approveCatches({ walletClient: arkivWallet, approvals, schemaName: config.arkiv.schemaName, txParamsFor: arkivTxParamsFor });
+  assert.equal(approved.approved, 1);
+  await until(async () => (await entityOf(campaignId, carolId))?.owner === carol.address, "approved transfer");
+  assert.equal((await fullEntity(carolId)).values.catched, true);
+  const apView = await call(`/api/campaigns/${campaignId}`);
+  assert.equal(apView.settlement.approvals.length, 0);
+  assert.equal(apView.settlement.autoSettled.length, 0, "an approval is never reported as automatic");
+  log(`approval campaign #${campaignId}: claim ${carolId} approved by the business -> ${carol.address}`);
+
+  // ---- Redeem: the code is revealed only to the owner, only after redeeming on chain.
+  const playerReveal = async (account, creatureId) => {
+    const issuedAt = new Date().toISOString();
+    const message = revealMessage({ chainId: CHAIN_ID, contract: deployment.campaignManager, campaignId: BigInt(creatureId) >> 32n, creatureId, address: account.address, issuedAt });
+    return call(`/api/campaigns/${BigInt(creatureId) >> 32n}/discount-codes/reveal`, { address: account.address, issuedAt, creatureId: String(creatureId), signature: await account.signMessage({ message }) });
+  };
+  await assert.rejects(playerReveal(carol, carolId), (e) => e.status === 403, "no code before redeeming");
+  await marketCall(carol, "redeem", [carolId]);
+  const carolRarity = Number((await chain.getCreature(carolId)).rarity);
+  assert.equal((await playerReveal(carol, carolId)).code, PLAIN_CODES[carolRarity], "the owner gets the plaintext code");
+  await assert.rejects(playerReveal(bob, carolId), (e) => e.status === 403, "nobody else");
+  if (MEMORY) {
+    const key = (await entityOf(campaignId, carolId)).key;
+    await arkiv.walletFor(carol.address).executeBatch({ patches: [{ schema, entityKey: key, set: { redeemed: true } }] });
+    assert.equal((await fullEntity(carolId)).values.redeemed, true);
+  }
+  log(`redeem: creature ${carolId} redeemed on chain; code revealed to its owner only`);
+
+  // ---- Marketplace (player-signed Arkiv writes: memory mode only).
+  if (!MEMORY) {
+    log("marketplace checks SKIPPED on real Arkiv (player dev keys hold no tGLM); run with E2E_ARKIV=memory");
+  } else {
+    const price = 10n ** 15n; // 0.001 ETH
+    const aliceKey = (await entityOf(autoId, aliceId)).key;
+    const escrow = (who, key, p) =>
+      arkiv.walletFor(who.address).executeBatch({ patches: [{ schema, entityKey: key, set: { listed: true, price: u64(p) } }], ownershipChanges: [{ entityKey: key, newOwner: settlerAddress }] });
+
+    // A redeemed creature can never be sold.
+    await assert.rejects(call("/api/market/attest", { creatureId: String(carolId), seller: carol.address, price: price.toString() }), (e) => e.status === 409);
+
+    await escrow(alice, aliceKey, price);
+    const att = await call("/api/market/attest", { creatureId: String(aliceId), seller: alice.address, price: price.toString() });
+    await marketCall(alice, "list", [aliceId, price, BigInt(att.deadline), att.signature]);
+    await sleep(1500);
+    assert.equal((await entityOf(autoId, aliceId)).owner, settlerAddress, "listed: stays in escrow");
+    log(`listed: creature ${aliceId} for ${price} wei (settler attestation accepted on chain)`);
+
+    const before = await chain.client.getBalance({ address: alice.address });
+    await marketCall(bob, "buy", [aliceId], price);
+    assert.equal(await chain.client.getBalance({ address: alice.address }), before + price, "the seller is paid");
+    await until(async () => (await entityOf(autoId, aliceId))?.owner === bob.address, "sale mirrored on Arkiv");
+    const sold = await fullEntity(aliceId);
+    assert.equal(sold.values.listed, false);
+    assert.equal(sold.values.price, undefined, "price unset");
+    assert.deepEqual((await call(`/api/campaigns/${autoId}`)).settlement.sales.map((x) => [x.creatureId, x.buyer]), [[String(aliceId), bob.address]]);
+    log(`bought: ${bob.address} paid ${price} wei to the seller; the settler moved the creature to the buyer`);
+
+    // The buyer lists it again, then unlists: it comes back.
+    await escrow(bob, aliceKey, 2n * price);
+    const att2 = await call("/api/market/attest", { creatureId: String(aliceId), seller: bob.address, price: (2n * price).toString() });
+    await marketCall(bob, "list", [aliceId, 2n * price, BigInt(att2.deadline), att2.signature]);
+    await marketCall(bob, "unlist", [aliceId]);
+    await until(async () => (await entityOf(autoId, aliceId))?.owner === bob.address, "unlist returns it");
+    assert.equal((await fullEntity(aliceId)).values.listed, false);
+    log("unlisted: the settler handed the creature back to its owner");
+
+    // An escrow that is never listed on chain goes back after the grace period.
+    await escrow(bob, aliceKey, price);
+    await until(async () => (await entityOf(autoId, aliceId))?.owner === bob.address, "abandoned escrow returned");
+    log("abandoned escrow: returned to its owner automatically");
+  }
 
   log("ALL END-TO-END CHECKS PASSED");
 }

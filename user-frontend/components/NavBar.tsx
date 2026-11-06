@@ -7,6 +7,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import Avatar, { shortAddr } from "@/components/Avatar";
+import { useWalletGuard } from "@/lib/useWalletGuard";
 import { ArtChest, ArtMap, ArtShop, BrandMark, IconCheck, IconCopy, IconLogout } from "@/components/icons";
 
 const LINKS = [
@@ -17,6 +18,8 @@ const LINKS = [
 
 export default function NavBar({ wallet }: { wallet?: string }) {
   const path = usePathname();
+  // Every logged-in page has the nav: if MetaMask switches away from the session's wallet, the session ends.
+  useWalletGuard(wallet);
   const [menu, setMenu] = useState(false);
   const [copied, setCopied] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);

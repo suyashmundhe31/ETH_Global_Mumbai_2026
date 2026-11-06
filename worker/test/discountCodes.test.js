@@ -47,7 +47,7 @@ test("the key must be 32 bytes base64", () => {
 });
 
 // ------------------------------------------------------------------ reveal authorization
-function setup({ arkivOwner = business.address, now = Date.UTC(2026, 10, 6, 12) } = {}) {
+function setup({ owner = business.address, redeemed = false, now = Date.UTC(2026, 10, 6, 12) } = {}) {
   const cipher = new CodeCipher(KEY);
   const codes = ["COM10", "RAR25", "EPI50", "LEG100"];
   const rewards = codes.map((code, r) => ({ code: cipher.encrypt(code, ctx(r)), description: `${code} reward` }));
@@ -58,10 +58,9 @@ function setup({ arkivOwner = business.address, now = Date.UTC(2026, 10, 6, 12) 
     getRewards: async () => rewards,
     read: async (fn, [id]) => ({ creatureId: id, rarity: Number(id & 3n) }), // creature index -> rarity
   };
-  const arkiv = {
-    findCampaignEntities: async () => new Map([[String((2n << 32n) | 3n), [{ key: "0x1", owner: arkivOwner }]]]),
-  };
-  const service = new DiscountCodeService({ chain, arkiv, cipher, now: () => now });
+  // CreatureMarket: creature (2 << 32) | 3 is held by `owner`.
+  const market = { getHolding: async (id) => (id === ((2n << 32n) | 3n) ? { owner, redeemed } : { owner: "0x0000000000000000000000000000000000000000", redeemed: false }) };
+  const service = new DiscountCodeService({ chain, market, cipher, now: () => now });
   const sign = async (account, { creatureId = null, issuedAt = new Date(now).toISOString() } = {}) => ({
     campaignId: 2n,
     creatureId,
@@ -85,8 +84,10 @@ test("a stranger cannot reveal, even with a valid signature of their own", async
   await assert.rejects(service.reveal(await sign(stranger, { creatureId: String((2n << 32n) | 3n) })), (e) => e.status === 403);
 });
 
-test("the creature's current Arkiv owner (e.g. a player after capture) reveals that creature's code only", async () => {
-  const { service, sign } = setup({ arkivOwner: player.address });
+test("the creature's owner sees its code only after redeeming it on chain", async () => {
+  const before = setup({ owner: player.address, redeemed: false });
+  await assert.rejects(before.service.reveal(await before.sign(player, { creatureId: String((2n << 32n) | 3n) })), (e) => e.status === 403 && /Redeem/.test(e.message));
+  const { service, sign } = setup({ owner: player.address, redeemed: true });
   const r = await service.reveal(await sign(player, { creatureId: String((2n << 32n) | 3n) }));
   assert.equal(r.code, "LEG100");
   assert.equal(r.rarity, "LEGENDARY");

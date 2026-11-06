@@ -88,13 +88,31 @@ export function buildConfig(env = process.env) {
     // AES-256-GCM key for discount codes (base64, 32 bytes). Server-side only: never sent to the browser.
     codeEncryptionKey: env.CODE_ENCRYPTION_KEY || "",
 
+    // The settler wallet (required). It holds Auto-settle campaigns' creatures and marketplace escrows on
+    // Arkiv, transfers them when CreatureMarket records a claim / sale / unlist, and signs the listing
+    // attestations CreatureMarket.list requires. Its address is CreatureMarket.settler().
+    settlement: {
+      privateKey: env.SETTLER_PRIVATE_KEY || "",
+      creatureMarket: env.CREATURE_MARKET_ADDRESS || deployment?.creatureMarket || "",
+      // First block to scan for market events on the first run (later runs resume from the saved
+      // checkpoint). Default: the block CreatureMarket was deployed in.
+      startBlock: env.MARKET_START_BLOCK ? BigInt(env.MARKET_START_BLOCK) : deployment?.marketDeployBlock !== undefined ? BigInt(deployment.marketDeployBlock) : null,
+      retryDelayMs: int(env.SETTLER_RETRY_DELAY_MS, 30_000),
+      sweepIntervalMs: int(env.SETTLER_SWEEP_INTERVAL_MS, 60_000),
+      // A creature moved into escrow without an on-chain listing is handed back after this long.
+      escrowGraceMs: int(env.ESCROW_GRACE_MS, 15 * 60_000),
+    },
+
     arkiv: {
       network: env.ARKIV_NETWORK || "rabdi", // "rabdi" | "localhost"
       accessKey: env.ARKIV_ACCESS_KEY ?? "",
       rpcUrl: env.ARKIV_RPC_URL || "",
       // No private key: the business signs the creature entities in MetaMask (it becomes $creator/$owner).
       schemaName: env.ARKIV_SCHEMA_NAME || DEFAULT_SCHEMA_NAME,
-      batchSize: int(env.ARKIV_BATCH_SIZE, 10), // creatures per business-signed Arkiv transaction
+      // Creatures per business-signed Arkiv transaction. 8 fits the Rabdi gas policy with headroom
+      // (measured ~0.83M gas per creature at maximum field sizes; 2× must stay under half the 30M
+      // block limit). The page also splits any batch that would not fit, before signing.
+      batchSize: int(env.ARKIV_BATCH_SIZE, 8),
       explorerUrl: env.ARKIV_EXPLORER_URL || "https://rabdi.explorer.arkiv.network",
     },
   };
@@ -109,6 +127,13 @@ export function assertRuntimeConfig(config) {
   }
   if (Buffer.from(config.codeEncryptionKey, "base64").length !== 32) {
     problems.push("CODE_ENCRYPTION_KEY must be set to 32 random bytes, base64 encoded. Generate one with: npm --prefix worker run gen-code-key");
+  }
+  const s = config.settlement;
+  if (!/^0x[0-9a-fA-F]{64}$/.test(s.privateKey)) {
+    problems.push("SETTLER_PRIVATE_KEY must be set (0x-prefixed 32-byte hex). Generate one with: npm --prefix worker run gen-key -- SETTLER");
+  }
+  if (!/^0x[0-9a-fA-F]{40}$/.test(s.creatureMarket)) {
+    problems.push("CREATURE_MARKET_ADDRESS is not set and contracts/deployments/<CHAIN_ID>.json has no creatureMarket. Deploy it with script/DeployMarket.s.sol.");
   }
   if (config.arkiv.batchSize < 1 || config.arkiv.batchSize > 100) {
     problems.push("ARKIV_BATCH_SIZE must be between 1 and 100.");

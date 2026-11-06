@@ -1,54 +1,36 @@
-// Spawns = uncaught Arkiv creatures, placed at the exact coordinates stored on Arkiv (latitudeE6 /
-// longitudeE6). Creatures of the same campaign at the same point share one spawn; a campaign placed at
-// several points gets one spawn per point. Shown when the chain says this player may catch in that
-// campaign (CatchManager.canSpawnFor). The catch itself is on chain: lib/chain.ts catchCreature.
+// A spawn as the map and the AR camera draw it: one per campaign, at the campaign's on-chain spawn point,
+// showing that campaign's NEXT creature (lib/creatures.ts loadSpawns, verified against CreatureMarket).
+// The claim itself is CreatureMarket.claim (lib/market.ts), which checks the same 50 m radius.
 
 import mapboxgl from "mapbox-gl";
-import type { Creature } from "@/lib/arkiv";
+import { modelUrl } from "@/lib/arkiv";
+import type { MapSpawn } from "@/lib/creatures";
+import { CLAIM_RADIUS_M, VISIBLE_RADIUS_M } from "@/lib/geo";
 
-export const VISIBLE_RADIUS = 1000; // m — spawns shown on the map
-export const CATCH_RADIUS = 100; // m — catch button enabled (CRE enforces the same radius)
+export const VISIBLE_RADIUS = VISIBLE_RADIUS_M; // m — spawns shown on the map
+export const CATCH_RADIUS = CLAIM_RADIUS_M; // m — CreatureMarket.CLAIM_RADIUS_M
 
 export type Campaign = {
-  /** Spawn id: campaign + exact Arkiv coordinates. Unique per point on the map. */
+  /** Spawn id = campaign id (one spawn per campaign). */
   id: string;
   campaignId: string;
   businessName: string;
   discountDescription: string;
-  lngLat: mapboxgl.LngLat; // exactly as stored on Arkiv
-  creatures: Creature[]; // uncaught, unexpired (per Arkiv), at this point
-  remaining: number;
-  modelUrl: string; // GLB shown on the map: the first creature still up for grabs here
+  lngLat: mapboxgl.LngLat;
+  modelUrl: string; // the next creature's own GLB on Swarm
+  expiresAt: number; // unix seconds, 0 = never
+  spawn: MapSpawn;
 };
 
-/** Arkiv stores coordinates as integer micro-degrees; the key uses them so equal points always match. */
-const e6 = (deg: number) => Math.round(deg * 1e6);
-
-/** One spawn per (campaign, exact point) within VISIBLE_RADIUS of `player`, limited to `spawnable` campaigns. */
-export function visibleCampaigns(creatures: Creature[], spawnable: Set<string>, player: mapboxgl.LngLat): Campaign[] {
-  const now = Date.now() / 1000;
-  const groups = new Map<string, Creature[]>();
-  for (const c of creatures) {
-    if (c.expiresAtUnix !== 0 && c.expiresAtUnix <= now) continue; // 0 = no expiry
-    if (!spawnable.has(c.campaignId)) continue;
-    const key = `${c.campaignId}@${e6(c.lat)},${e6(c.lng)}`;
-    groups.set(key, [...(groups.get(key) ?? []), c]);
-  }
-  const out: Campaign[] = [];
-  for (const [id, list] of groups) {
-    const first = list[0];
-    const lngLat = new mapboxgl.LngLat(first.lng, first.lat);
-    if (lngLat.distanceTo(player) > VISIBLE_RADIUS) continue;
-    out.push({
-      id,
-      campaignId: first.campaignId,
-      businessName: first.businessName,
-      discountDescription: first.discountDescription,
-      lngLat,
-      creatures: list,
-      remaining: list.length,
-      modelUrl: list.reduce((a, c) => (c.creatureId < a.creatureId ? c : a)).modelUrl, // stable pick
-    });
-  }
-  return out;
+export function toCampaign(s: MapSpawn): Campaign {
+  return {
+    id: s.campaignId,
+    campaignId: s.campaignId,
+    businessName: s.businessName,
+    discountDescription: s.description,
+    lngLat: new mapboxgl.LngLat(s.longitudeE6 / 1e6, s.latitudeE6 / 1e6),
+    modelUrl: modelUrl(s.entity.swarmReference || s.entity.campaignSwarmReference),
+    expiresAt: s.expiresAt,
+    spawn: s,
+  };
 }

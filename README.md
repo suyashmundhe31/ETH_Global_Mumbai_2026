@@ -6,15 +6,15 @@ The repo has two web apps that share the contracts, the worker and the Arkiv sch
 | App | Folder | Who | What | Stack | Port |
 |---|---|---|---|---|---|
 | **Business interface** | [`business-frontend/`](business-frontend) | Businesses | Launch Campaign flow, end to end (below) | Vite, viem, `@arkiv-network/sdk` | 5173 |
-| **User interface** | [`user-frontend/`](user-frontend) | Players | World ID login bound to a wallet, Mapbox game map with a 3D player avatar (see [User interface](#user-interface)) | Next.js 16, React 19, `@worldcoin/idkit`, mapbox-gl, three | 3000 |
+| **User interface** | [`user-frontend/`](user-frontend) | Players (World ID verified humans only) | Map (claim creatures within 50 m), Profile (redeem / sell), Marketplace (buy). See [Player flow](#player-flow-claim-settlement-redeem-marketplace) | Next.js 16, React 19, `@worldcoin/idkit`, mapbox-gl, three | 3000 |
 
 ```
 .
 ├── business-frontend/   Business interface (Vite)
 ├── user-frontend/       User interface (Next.js)
-├── worker/              Node API + chain listener (Swarm, Arkiv prepare/verify, discount codes)
-├── contracts/           Foundry: CreatureCampaignManager + Chainlink VRF
-├── shared/              Code used by worker + business-frontend (Arkiv schema, discount-code format)
+├── worker/              Node API + chain listener (Swarm, Arkiv prepare/verify, discount codes) + settler
+├── contracts/           Foundry: CreatureCampaignManager (Chainlink VRF) + CreatureMarket (claim / redeem / sell)
+├── shared/              Code used by worker + both apps (Arkiv schema, gas policy, discount-code format)
 ├── assets/creatures/    .glb models offered in the business form
 └── scripts/             ABI sync, sample .glb generator
 ```
@@ -36,10 +36,10 @@ Worker ──verify (query $creator = on-chain business)──▶ COMPLETE / PAR
 
 | Layer | Responsibility | Tech |
 |---|---|---|
-| `contracts/` | Campaigns, VRF request/fulfilment, on-chain Fisher–Yates rarity allocation, authoritative creature records | Solidity 0.8.28, Foundry, Chainlink VRF v2.5 |
-| `worker/` | Swarm uploads, chain event listener, Arkiv payload preparation + verification (read-only, no Arkiv key), HTTP API, local VRF simulator | Node 22, viem, `@ethersphere/bee-js`, `@arkiv-network/sdk` |
+| `contracts/` | Campaigns, VRF request/fulfilment, on-chain Fisher–Yates rarity allocation, authoritative creature records; `CreatureMarket`: claims (50 m, next creature, one per player per campaign, human ticket), redemption, listings and sales | Solidity 0.8.28, Foundry, Chainlink VRF v2.5, OpenZeppelin 5.7.0 |
+| `worker/` | Swarm uploads, chain event listener, Arkiv payload preparation + verification, HTTP API, discount codes, the **settler** (Auto-settle transfers, marketplace escrow, listing attestations), local VRF simulator | Node 22, viem, `@ethersphere/bee-js`, `@arkiv-network/sdk` |
 | `business-frontend/` | Launch Campaign page: form, MetaMask, `.glb` preview, map, status; the business signs the Arkiv entities | Vite, viem, `@arkiv-network/sdk`, `<model-viewer>`, Leaflet |
-| `user-frontend/` | Player login (World ID + wallet) and game map | Next.js, React, `@worldcoin/idkit`, mapbox-gl, three |
+| `user-frontend/` | World ID login, map + claim, profile (redeem / sell), marketplace (buy); server routes issue claim tickets and proxy the worker | Next.js, React, `@worldcoin/idkit`, mapbox-gl, three |
 | `shared/` | The Arkiv creature schema and discount-code format, used by worker and business-frontend | plain ESM, SDK passed in |
 | `assets/creatures/` | `.glb` creature models offered in the form | glTF 2.0 binary |
 | Arkiv | One entity per Creature (metadata + Swarm reference + lifecycle flags), created and owned by the business | Rabdi testnet |
@@ -85,17 +85,30 @@ Creatures are **not NFTs**: they are Arkiv entities whose 3D model lives on Swar
 Arkiv writes are **not** assumed atomic across creatures (`worker/src/campaignArkiv.js`, `business-frontend/src/arkivWrite.js`):
 - every plan (`POST /api/campaigns/:id/arkiv/plan`) is computed after re-reading Arkiv for entities **created by
   the campaign's business** (`$creator` = `business` read from the contract) with the same
-  `chainId + contract + campaignId` — only creatures without a valid entity are offered for signing;
-- the business signs independent batches (each one atomic `executeBatch`); a failed batch does not stop the
-  others, a rejected signature stops the run;
+  `chainId + contract + campaignId` — only creatures without a valid entity are offered for signing. The scan
+  is a **keyset walk ordered by `$key`** with `onMismatch: "throw"` (offset paging can skip existing
+  entities when others expire mid-scan, which would make the plan ask for them again);
+- the business signs batches (each one atomic `executeBatch`). The run **stops at the first failed batch**: a
+  JavaScript error does not prove the chain rejected a write. If that batch has a transaction hash, it is
+  reported as pending and its creatures are **held back from every plan** until Arkiv shows the transaction
+  reverted or dropped (the worker only accepts a hash the Arkiv node knows, sent by the campaign's business
+  to the entity address `0x44…44`);
+- account and chain are re-checked before every signature; gas is explicit:
+  `max(1,000,000 + 400,000 × (n − 1), 2 × unsigned estimate)`, at most half the block gas limit — a batch that
+  would not fit is split before anything is signed (measured on Rabdi: ~0.83M gas per creature at maximum
+  field sizes, so the default `ARKIV_BATCH_SIZE` is 8);
 - entity keys returned by each transaction are reported (`/arkiv/submissions`) and re-read with `getEntity`,
   so a lagging query index can never cause a duplicate — and they are never trusted blindly ($creator,
   rarity and reward must match the chain);
 - `POST /api/campaigns/:id/arkiv/verify` checks Arkiv itself and reports `COMPLETE` or `PARTIAL` with the exact
   missing creature IDs; the "Sign missing creatures" button re-plans and signs only those.
 
-Example: 10 creatures, 7 written → the retry plan contains exactly the 3 missing creatures (covered by
-`worker/test/campaignArkiv.test.js` and the end-to-end test).
+Example: 10 creatures, batch 8 fails → 7 written, the retry plan contains exactly the 3 missing creatures
+(covered by `worker/test/campaignArkiv.test.js` and the end-to-end test).
+
+These rules follow Arkiv's official agent skills ([Arkiv-Network/skills](https://github.com/Arkiv-Network/skills):
+`arkiv-write-safety`, `arkiv-query`, `arkiv-app-integration`, `arkiv-security-trust`), installed for Claude
+Code in `.claude/skills/` (local, git-ignored; source commit in `.claude/skills/ARKIV_SKILLS_SOURCE.txt`).
 
 ---
 
@@ -146,13 +159,13 @@ Copy each `.env.example` and fill it in. Real `.env` files are git-ignored.
 | File | Copy to | Contains |
 |---|---|---|
 | [contracts/.env.example](contracts/.env.example) | `contracts/.env` | RPC URLs, deployer key, VRF coordinator / key hash / subscription |
-| [worker/.env.example](worker/.env.example) | `worker/.env` | chain RPC, Swarm node + postage batch, Arkiv network + access key (no Arkiv key) |
-| [business-frontend/.env.example](business-frontend/.env.example) | `business-frontend/.env.local` | **public** values only: API URL, chain id, RPC, contract address, optional Arkiv access key |
-| [user-frontend/.env.example](user-frontend/.env.example) | `user-frontend/.env.local` | World ID app / RP id / environment, Mapbox token + style (public), `RP_SIGNING_KEY` (**secret**, server-side only) |
+| [worker/.env.example](worker/.env.example) | `worker/.env` | chain RPC, Swarm node + postage batch, Arkiv network + access key, `CODE_ENCRYPTION_KEY`, `SETTLER_PRIVATE_KEY` (**secret**) |
+| [business-frontend/.env.example](business-frontend/.env.example) | `business-frontend/.env.local` | **public** values only: API URL, chain id, RPC, contract address (no Arkiv key: the wallet uses its own Arkiv RPC) |
+| [user-frontend/.env.example](user-frontend/.env.example) | `user-frontend/.env.local` | World ID app / RP id / environment, Mapbox token + style (public), `WORKER_URL`, `RP_SIGNING_KEY` and `HUMAN_SIGNER_PRIVATE_KEY` (**secrets**, server-side only) |
 
 Secrets (deployer key, Swarm batch, RPC provider keys) live only in `contracts/.env` / `worker/.env`.
-Nobody's private key reaches the frontend or the worker at runtime: the business signs both the campaign
-transaction and the Arkiv creature entities in MetaMask.
+No private key reaches a browser: the business and players sign in MetaMask. The only server keys are the
+worker's settler (Arkiv transfers + listing attestations) and the user app's human signer (claim tickets).
 
 Key worker variables:
 
@@ -168,8 +181,11 @@ Key worker variables:
 | `ARKIV_ACCESS_KEY` | Rabdi RPC access key for the worker's reads (empty = rate-limited public endpoint) |
 | `ARKIV_SCHEMA_NAME` | `ethglobal-mumbai-2026.creature.v2` |
 | `ARKIV_BATCH_SIZE` | Creatures per business-signed Arkiv transaction (= one MetaMask confirmation each) |
+| `CREATURE_MARKET_ADDRESS`, `MARKET_START_BLOCK` | Optional; default `creatureMarket` / `marketDeployBlock` from `contracts/deployments/<CHAIN_ID>.json` |
+| `SETTLER_PRIVATE_KEY` | **Secret, required.** The settler wallet (`npm --prefix worker run gen-key -- SETTLER`); must equal `CreatureMarket.settler` (checked at start). Fund it with tGLM |
+| `ESCROW_GRACE_MS` | How long an escrow may wait for its on-chain listing before it is handed back (default 15 min) |
 
-`ARKIV_PRIVATE_KEY` is no longer used (the worker warns if it is still set): the business signs the entities.
+`ARKIV_PRIVATE_KEY`, `CATCH_MANAGER_ADDRESS` and `CATCH_START_BLOCK` are no longer used (the worker warns).
 
 ## 5. Run locally (Anvil + Chainlink VRF mock)
 
@@ -192,7 +208,15 @@ forge script script/DeployLocal.s.sol:DeployLocal --rpc-url local --broadcast
 `contracts/.env` needs `LOCAL_RPC_URL=http://127.0.0.1:8545` and `DEPLOYER_PRIVATE_KEY` (Anvil prints its dev
 account keys on start; account #0 is fine locally).
 
-Terminal 3 — worker (set `LOCAL_VRF_FULFILLER_PRIVATE_KEY` in `worker/.env` first):
+Then CreatureMarket (adds `creatureMarket` to the same file). First generate the two signer keys with
+`npm --prefix worker run gen-key -- SETTLER` and `npm --prefix worker run gen-key -- HUMAN_SIGNER`, then pass
+their **addresses**:
+
+```bash
+HUMAN_SIGNER_ADDRESS=0x… SETTLER_ADDRESS=0x… forge script script/DeployMarket.s.sol:DeployMarket --rpc-url local --broadcast
+```
+
+Terminal 3 — worker (set `LOCAL_VRF_FULFILLER_PRIVATE_KEY` and `SETTLER_PRIVATE_KEY` in `worker/.env` first):
 
 ```bash
 npm --prefix worker start
@@ -240,6 +264,9 @@ forge script script/Deploy.s.sol:Deploy --rpc-url sepolia --broadcast
 ```
 
 5. If `VRF_ADD_CONSUMER=false`, add the printed contract address as a consumer in the subscription UI.
+   Then deploy CreatureMarket next to it (no VRF needed; adds `creatureMarket` + `marketDeployBlock` to the file;
+   an existing campaign manager is read from the deployment file, or set `CAMPAIGN_MANAGER_ADDRESS`):
+   `HUMAN_SIGNER_ADDRESS=0x… SETTLER_ADDRESS=0x… forge script script/DeployMarket.s.sol:DeployMarket --rpc-url sepolia --broadcast`
 6. Worker: `CHAIN_ID=11155111`, `CHAIN_RPC_URL=<sepolia rpc>`, `VRF_MODE=chainlink`
    (the real Chainlink service fulfils; the worker only listens).
 7. Frontend: `VITE_CHAIN_ID=11155111`, `VITE_CHAIN_NAME=Sepolia`, `VITE_RPC_URL=<public sepolia rpc>`,
@@ -336,52 +363,116 @@ Everything on-chain and on Arkiv is public, so the discount code is encrypted **
   (`revealMessage`: campaign, creature or "all", chain, contract, wallet, time — no gas, no transaction); the
   worker rebuilds the text, verifies the signature (viem `verifyMessage`) and decrypts only for:
   - the campaign's **business wallet** (read from the contract): all codes of its campaign;
-  - the current **Arkiv `$owner`** of a creature created by that business: that creature's code (today the
-    business; after a capture transfer, the player).
+  - the creature's **owner on CreatureMarket**, and only after it was **redeemed** there: that creature's code.
   Signatures expire after 5 minutes. The page's "Reveal discount codes" button does this for the business.
 
 ## User interface
 
-`user-frontend/` (Next.js App Router) is the players' app. Run it next to the business interface:
+`user-frontend/` (Next.js App Router) is the players' app, with three tabs: **Profile**, **Marketplace**, **Map**.
 
 ```bash
 npm --prefix user-frontend run dev
 ```
 
-then open http://localhost:3000 (production build: `npm --prefix user-frontend run build` then
-`npm --prefix user-frontend start`; lint: `npm --prefix user-frontend run lint`). Configure
-`user-frontend/.env.local` from [user-frontend/.env.example](user-frontend/.env.example) first.
+then open http://localhost:3000 (production: `npm --prefix user-frontend run build` then
+`npm --prefix user-frontend start`). Configure `user-frontend/.env.local` from
+[user-frontend/.env.example](user-frontend/.env.example): World ID, Mapbox, `WORKER_URL` and
+`HUMAN_SIGNER_PRIVATE_KEY`. Contract addresses, networks and the settler come from the worker (`/api/config`).
 
-Flow:
-1. **Login** (`components/LoginButton.tsx`): MetaMask connects; `POST /api/rp-signature` returns a World ID RP
-   signature and a challenge message the wallet signs; IDKit runs a World ID proof-of-human with the wallet
-   address as the signal.
-2. **Verify** (`app/api/verify/route.ts`): checks the wallet signature and that the challenge came from this
-   server, that the proof is bound to the wallet (`signal_hash`), validates the proof with World's
-   `developer.world.org/api/v4/verify`, then links **one human (nullifier) to one wallet**
-   (`lib/players.ts`, stored in `players.json`, git-ignored) and sets an HMAC-signed `session` cookie.
-3. **Map** (`app/page.tsx` → `components/MapClient.tsx` / `GameMap.tsx`): verified players get the Mapbox map
-   with a three.js player avatar (`public/models/player.glb`) following GPS; dev mode (default outside
-   production) walks with clicks / arrow keys. `POST /api/logout` clears the session.
+**Login: verified humans only** (`components/LoginButton.tsx`, `app/api/verify/route.ts`). MetaMask signs a
+server challenge. A wallet already linked to a verified human logs straight in. Otherwise IDKit runs World ID
+proof-of-human with the wallet as the signal. The server checks the wallet signature, the signal binding and
+World's `developer.world.org/api/v4/verify`. It then links one human (nullifier) to one wallet (`players.json`)
+and sets an HMAC-signed, 7-day `session` cookie. Any failure shows an **Unverified** pop-up. Every page and API
+route checks the session. Switching the MetaMask account ends it (`SessionGuard`).
 
-The user interface does not read campaigns or creatures yet: creatures for the map come from Arkiv (query by
-`$creator` = the campaign's business, see [Arkiv setup](#8-arkiv-setup-and-data-model)).
+## Player flow: claim, settlement, redeem, marketplace
+
+Everything a player does is decided on chain by **`CreatureMarket`** (`contracts/src/CreatureMarket.sol`). Arkiv
+mirrors it. There is no Chainlink CRE: its referee logic (distance, one creature per human per campaign) is in the
+contract.
+
+**Map** (`lib/creatures.ts` → `loadSpawns`, `lib/spawns.ts`, `components/Spawns.tsx`):
+1. **Find campaigns.** Arkiv is queried for uncaught, unexpired creatures of this deployment inside a box around
+   the player. Each campaign is checked on chain: the entity's `$creator` must be the campaign's business, and the
+   campaign must be allocated, not expired and not depleted.
+2. **Choose what to show.** Only campaigns within **500 m** are kept, and never one the player already claimed
+   from. **One creature per business**: its nearest campaign. Counts are never shown.
+3. **Pick the creature.** It is the campaign's **next** creature (`CreatureMarket.nextCreature`). Creature indexes
+   were shuffled by Chainlink VRF, so its rarity is random and nobody can choose another one. Its Arkiv entity must
+   agree with the chain (rarity).
+4. **Open it.** Within **50 m** (the same integer math as the contract, `lib/geo.ts`), tapping the creature opens
+   a modal with all its info (code 🔒 encrypted) and its 3D model. **Claim it** asks this app's server for a
+   **claim ticket** (EIP-712, signed with `HUMAN_SIGNER_PRIVATE_KEY` for the session's wallet only), then sends
+   `CreatureMarket.claim(creatureId, lat, lon, deadline, ticket)`.
+5. **The contract checks**: the ticket, the 50 m radius, that this is the next creature, and one per player per
+   campaign. Then it emits `CreatureClaimed`.
+
+**Settlement** (business app, section **F**, chosen per campaign):
+
+| | **Approval** (default) | **Auto settle** |
+|---|---|---|
+| Launch | `$creator` = `$owner` = business | The same atomic batches hand each creature to the settler: `$owner` = settler |
+| Valid claim | The business sees it under "Claims awaiting your approval" and clicks **Approve**. MetaMask signs `catched = true` (+ `redeemed` as on chain) and ownership → player | The worker's **settler** sees `CreatureClaimed`, re-checks chain + Arkiv, and sends one atomic batch: `catched = true` (+ chain-truth fields) and ownership → player. The business is notified (feed + banner) |
+| Invalid claim | Reverts on chain (too far, not next, second claim, bad ticket): nothing happens | Same: nothing |
+
+**Profile** (`components/Profile.tsx`):
+- **What it shows.** The wallet, and every creature it owns on Arkiv, cross-checked on chain. It also shows its
+  listings and claims still on the way ("awaiting business approval" / "arriving").
+- **Redeem.**
+  1. `CreatureMarket.redeem` (final; a redeemed creature can never be sold).
+  2. The player signs the reveal message. The worker decrypts the code only for the creature's on-chain owner,
+     and only once it is redeemed.
+  3. Arkiv `redeemed = true` (the owner signs).
+- **Sell** (not redeemed).
+  1. **Escrow on Arkiv**: one atomic batch sets `listed = true` and `price` and changes ownership → settler.
+  2. The settler checks, then signs a **listing attestation** (`POST /api/market/attest`, EIP-712). It checks:
+     - the seller owns the creature on chain;
+     - it is not redeemed and not listed;
+     - the escrowed entity is the business's, with this exact price;
+     - **every chain-derived column is untampered**.
+  3. `CreatureMarket.list` accepts only that attestation.
+- **Tampered data.** It is refused and restored from the chain, and the creature is handed back.
+- **Abandoned escrow.** An escrow never listed on chain returns after `ESCROW_GRACE_MS` (15 min).
+- **Unlist.** `CreatureMarket.unlist`; the settler hands the entity back.
+
+**Marketplace** (`components/Market.tsx`):
+- **What it lists.** Only escrowed entities (`$owner` = settler, `listed = true`) whose on-chain listing has the
+  same price and that are not redeemed.
+- **Buy.** `CreatureMarket.buy` takes the exact price and pays the seller in the same transaction. The settler
+  then moves the Arkiv entity to the buyer (`listed = false`, price unset). The business sees resales in its feed.
+
+**The settler** (`worker/src/settler.js`):
+- **Wallet.** It is one worker wallet (`SETTLER_PRIVATE_KEY` = `CreatureMarket.settler`) that holds Auto-settle
+  creatures and escrows.
+- **How it decides.** It scans `CreatureMarket` events and sweeps the escrows it holds. For each creature it
+  converges Arkiv to the chain: the owner, `catched` / `redeemed` / `listed` / `price`, and any tampered column.
+- **Write safety** (Arkiv skills `arkiv-write-safety`, `arkiv-entity-lifecycle`):
+  - one signer and one transaction at a time;
+  - intent is saved before sending;
+  - lost receipts are reconciled by hash;
+  - a send without a hash waits for an idle nonce;
+  - gas is set explicitly for Rabdi (`shared/arkivGas.js`).
+- **What it ignores.** Only entities created by the campaign's business (read from the contract) count.
+- **Custody.** It never holds a creature that a player owns outside an escrow.
 
 ## 9. Tests
 
 | What | Command | Covers |
 |---|---|---|
-| Contracts (33 tests, incl. fuzz) | `cd contracts` then `forge test` | distribution preservation (fuzzed), Fisher–Yates permutation + uniform sampling, unique IDs, reward ↔ rarity, VRF only from coordinator, duplicate/stale/unknown fulfilment ignored without revert, cancel/retry access control, validation, 500-creature callback gas |
-| Worker unit (35 tests) | `npm --prefix worker test` | GLB validation + per-creature stamping, shared schema (new fields, no `business`), expiration, prepare/plan/verify: business = `$creator` = `$owner`, partial failure 7/10 → retry plans 3, lost receipts, index lag, look-alikes from other wallets ignored, forged rarity rejected, stale schema records, Swarm failure, listener retries, windowed log queries; discount codes: round trip, 64-byte fit, binding to business/rarity/key, tamper, reveal by business / creature owner only, signature replay + expiry |
-| User frontend | `npm --prefix user-frontend run lint` then `npm --prefix user-frontend run build` | ESLint (next/core-web-vitals + TypeScript) and a full type-checked production build |
-| Business frontend unit (11 tests) | `npm --prefix business-frontend test` | form validation / contract input mapping (incl. 16-byte code limit); Arkiv signing: batching, key reporting, failed batch continues, MetaMask rejection stops, Rabdi chain |
-| End-to-end | `npm --prefix worker run e2e` | spawns Anvil (chain 31338, port 8546), deploys with forge, Swarm upload through the API, `createCampaign` from a business account, VRF mock fulfilment, on-chain allocation, listener → per-creature Swarm assets → plan → **the business signs** the Arkiv entities with the page's code → verification against chain + Arkiv + Swarm, `$creator = $owner = business`, empty re-plan |
+| Contracts (54 tests, incl. fuzz) | `cd contracts` then `forge test` | CreatureMarket: next-creature claims, 50 m radius (exact edges + fuzz), one per campaign, race loser, human tickets (signer, player binding, expiry, max TTL), campaign states, redeem rules, settler attestation bound to price, buy pays the seller, unlist, payment failure + reentrancy, admin; campaign manager: distribution preservation (fuzzed), Fisher–Yates permutation + uniform sampling, unique IDs, reward ↔ rarity, VRF only from coordinator, duplicate/stale/unknown fulfilment ignored without revert, cancel/retry access control, validation, 500-creature callback gas |
+| Worker unit (53 tests) | `npm --prefix worker test` | settler: auto claim → transfer + `catched` + business feed, approval campaign untouched, escrow → attestation (verified as EIP-712) → listed → sold → buyer, unlist → seller, abandoned escrow returned after grace, attestation checks (owner, price, redeemed, escrow), tampered data refused + restored, sale seen by a sweep before its event, lost receipt reconciled, look-alikes ignored; keyset scan;  GLB validation + per-creature stamping, shared schema (new fields, no `business`), expiration, prepare/plan/verify: business = `$creator` = `$owner`, partial failure 7/10 → retry plans 3, lost receipts, index lag, look-alikes from other wallets ignored, forged rarity rejected, stale schema records, Swarm failure, listener retries, windowed log queries; discount codes: round trip, 64-byte fit, binding to business/rarity/key, tamper, reveal by business / creature owner only, signature replay + expiry |
+| User frontend (6 tests) | `npm --prefix user-frontend test`, `npm --prefix user-frontend run lint`, `npm --prefix user-frontend run build` | the 50 m check equals the contract's (same edge cases), spawn selection (one per business, nearest, claimed / unavailable / far hidden); ESLint; full type-checked production build |
+| Business frontend unit (22 tests) | `npm --prefix business-frontend test` | form validation / contract input mapping (incl. 16-byte code limit); Arkiv signing: batching, key reporting, stop on failure, MetaMask rejection, account re-check, gas policy + auto split, Auto settle batches (predicted salts + transfer to the settler in the same batch), approval batches (`catched` + ownership → player, stop on rejection) |
+| End-to-end | `npm --prefix worker run e2e` | spawns Anvil (chain 31338, port 8546), deploys with forge, Swarm upload through the API, `createCampaign` from a business account, VRF mock fulfilment, on-chain allocation, listener → per-creature Swarm assets → plan → **the business signs** the Arkiv entities with the page's code → verification against chain + Arkiv + Swarm, `$creator = business`, empty re-plan; then CreatureMarket: an **Auto settle** campaign (valid claim ~33 m away → transferred automatically + business feed; too far / second claim / foreign ticket refused on chain, nothing moves), the **Approval** campaign (claim listed for approval, approved with the business app's code), **redeem** (code only after redeeming, only for the owner), **marketplace** (escrow → attestation → list → buy pays the seller → buyer owns it on Arkiv; relist + unlist returns it; abandoned escrow returned) |
 
 The e2e test writes to **real Arkiv (Rabdi)**: set `E2E_BUSINESS_PRIVATE_KEY` to a test key funded with tGLM
 (it is used as the business on both chains). `E2E_ARKIV=memory` (set in the environment) swaps in an
 in-memory Arkiv double and also injects a 7/10 partial failure + retry; in that mode Arkiv itself is not
-exercised. Swarm is real in both modes. Frontend dependencies must be installed (the e2e imports the page's
-Arkiv module).
+exercised. Swarm is real unless `E2E_SWARM=memory` (an in-memory double, for when the public gateway is down).
+Real Arkiv also needs `E2E_SETTLER_PRIVATE_KEY` (tGLM-funded); player-signed Arkiv writes (redeemed flag,
+marketplace escrow) run in memory mode only, since the dev player keys hold no tGLM. Business-frontend
+dependencies must be installed (the e2e imports the page's Arkiv module).
 
 ## 10. Dependency versions
 
@@ -393,6 +484,7 @@ Solidity libraries are git submodules pinned to tags (see `contracts/foundry.loc
 | Node.js / npm | 22.22.0 / 10.9.4 (enforced) |
 | Solidity / evm | 0.8.28 / cancun |
 | forge-std | v1.17.0 |
+| OpenZeppelin contracts | v5.7.0 |
 | smartcontractkit/chainlink-brownie-contracts | 1.3.0 (mirror of `@chainlink/contracts`, VRF v2.5) |
 | @arkiv-network/sdk | 1.0.1 |
 | @ethersphere/bee-js | 13.2.0 |
@@ -408,13 +500,18 @@ Solidity libraries are git submodules pinned to tags (see `contracts/foundry.loc
   lifetime; a scheduled `extendEntity` job is not implemented yet (entities are created with
   `permissionlessExtension`, so such a job does not need the business's key).
 - **Business signs on Arkiv**: one MetaMask confirmation per `ARKIV_BATCH_SIZE` creatures (a 500-creature
-  campaign = 50 confirmations at the default 10), and the business needs tGLM on Rabdi. Larger batches mean
-  fewer confirmations but more gas per transaction; the SDK caps a transaction at 2^24 gas.
+  campaign = 63 confirmations at the default 8), and the business needs tGLM on Rabdi. Larger batches mean
+  fewer confirmations but more gas per transaction; batches above the gas policy are split automatically.
 - **Owner can edit**: entities are not `readonly` so the owner can set `listed` / `catched` / `redeemed` /
   `price`; the owner can therefore also patch other columns. The worker's verification compares rarity and
   reward with the chain, which stays the authoritative record.
-- **Capture transfer**: Arkiv only lets the current owner `changeOwnership` (no approvals / delegation), so
-  transferring a creature to a player on capture needs a signature from the business wallet. Not implemented yet.
+- **Transfers on Arkiv**: Arkiv only lets the current owner `changeOwnership` (no delegation), so Approval needs
+  the business's signature, and Auto settle / the marketplace rely on the settler's custody (keep its key
+  server-side). Players need tGLM on Rabdi to redeem (flag) and to escrow a creature for sale.
+- **Location is self-reported**: the contract checks the position the player's device sends (as the CRE referee
+  did); a spoofed GPS cannot be detected on chain. The human ticket limits this to one verified human per wallet.
+- **Tamper check**: a contract cannot read Arkiv, so the "untampered data" check of a listing is done by the
+  settler before it signs the attestation that `CreatureMarket.list` requires.
 - **Arkiv local node**: the official devnet harness (Kurtosis + Rust build) is marked "scaffold only", so local
   and e2e runs use the Rabdi testnet (or the in-memory double).
 - **Swarm gateway** uploads (no own batch) are for demos only; durable storage requires your own Bee node and a

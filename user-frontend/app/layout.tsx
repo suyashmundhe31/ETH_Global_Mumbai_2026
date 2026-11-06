@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { Lilita_One, Nunito } from "next/font/google";
 import "./globals.css";
+import TouchGuard from "@/components/TouchGuard";
 
 // Self-hosted by next/font at build time: Lilita One is the chunky game lettering, Nunito the rounded UI text.
 const lilita = Lilita_One({ subsets: ["latin"], weight: "400", variable: "--font-lilita", display: "swap" });
@@ -24,7 +25,10 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={`${lilita.variable} ${nunito.variable}`}>
-      <body>{children}</body>
+      <body>
+        <TouchGuard />
+        {children}
+      </body>
     </html>
   );
 }

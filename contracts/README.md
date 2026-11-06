@@ -39,3 +39,22 @@ Events: `CampaignCreated`, `RandomnessRequested`, `RandomnessFulfilled`, `Rarity
 `FulfillmentIgnored`, `CampaignCancelled`, `VrfConfigUpdated`.
 
 See the root [README](../README.md) for the full setup.
+
+## CreatureMarket
+
+`src/CreatureMarket.sol` is the player side, and the authority Arkiv mirrors. It reads `CreatureCampaignManager`
+and never changes it.
+
+| Function | Rule |
+|---|---|
+| `claim(creatureId, lat, lon, deadline, humanSig)` | ticket signed by `humanSigner` for `msg.sender`; campaign allocated and not expired; `creatureId` is the campaign's next one (`claimedCount`); one per player per campaign; within `CLAIM_RADIUS_M` = 50 m (`distanceSquaredUm`) |
+| `redeem(creatureId)` | owner only, once, not while listed |
+| `list(creatureId, price, deadline, settlerSig)` | owner, not redeemed, not listed, 0 < price ≤ 2^64-1 wei, attestation signed by `settler` |
+| `unlist` / `buy` | seller only / exact price, seller paid in the same transaction |
+
+Deploy it after `Deploy` / `DeployLocal`. The script reads the campaign manager from `deployments/<chainId>.json` and
+adds `creatureMarket` and `marketDeployBlock` to that file:
+
+```bash
+HUMAN_SIGNER_ADDRESS=0x… SETTLER_ADDRESS=0x… forge script script/DeployMarket.s.sol:DeployMarket --rpc-url sepolia --broadcast
+```

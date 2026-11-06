@@ -190,6 +190,64 @@ test("a stale record from an older schema (COMPLETE, other owner's keys) is re-v
   assert.equal(arkiv.entities.size, 0);
 });
 
+// ------------------------------------------------------------------ arkiv-write-safety: uncertain sends
+const BATCH = (plan, n) => plan.payloads.slice(0, n).map((p) => p.creatureId);
+
+test("creatures of a still-pending transaction are held back, not planned again", async () => {
+  const { arkiv, service } = setup({ batchSize: 10 });
+  const plan = await service.plan(1n);
+  const txHash = arkiv.addTx({ from: BUSINESS, status: "pending" }); // sent, receipt unknown
+  await service.recordSubmission(1n, { txHash, pending: BATCH(plan, 4) });
+  const again = await service.plan(1n);
+  assert.equal(again.payloads.length, 6, "the 4 creatures in flight are not offered for signing");
+  assert.deepEqual(again.pending, [{ txHash, status: "pending", creatureIds: BATCH(plan, 4) }]);
+});
+
+test("a pending transaction that reverts or is dropped releases its creatures", async () => {
+  for (const outcome of ["reverted", "dropped"]) {
+    const { arkiv, service } = setup({ batchSize: 10 });
+    const plan = await service.plan(1n);
+    const txHash = arkiv.addTx({ from: BUSINESS, status: "pending" });
+    await service.recordSubmission(1n, { txHash, pending: BATCH(plan, 4) });
+    if (outcome === "reverted") arkiv.txs.get(txHash).status = "reverted";
+    else arkiv.txs.delete(txHash); // the node no longer knows it
+    const again = await service.plan(1n);
+    assert.equal(again.payloads.length, 10, `${outcome}: all creatures can be signed again`);
+    assert.deepEqual(again.pending, []);
+  }
+});
+
+test("an applied transaction keeps its creatures held until Arkiv shows them, then clears", async () => {
+  const { arkiv, service } = setup({ batchSize: 10 });
+  const plan = await service.plan(1n);
+  arkiv.landThenThrow = 1; // written, but the browser lost the receipt
+  let lost;
+  try {
+    await arkiv.walletFor(BUSINESS).executeBatch({ creates: creatureCreates(sdk, schema, plan.payloads, creatureExpiration(sdk, 0).expiration) });
+  } catch (err) {
+    lost = err.txHash;
+  }
+  await service.recordSubmission(1n, { txHash: lost, pending: BATCH(plan, 10) });
+  for (const key of arkiv.entities.keys()) arkiv.hiddenFromQuery.add(key); // index has not caught up
+  assert.equal((await service.plan(1n)).payloads.length, 0, "success receipt: nothing re-planned");
+  arkiv.hiddenFromQuery.clear();
+  assert.equal((await service.verify(1n)).status, ARKIV_STATUS.COMPLETE);
+  assert.deepEqual((await service.plan(1n)).pending, [], "pending marker cleared once verified");
+  assertNoDuplicates(arkiv);
+});
+
+test("a pending hash is only accepted if it is a real Arkiv write from the campaign's business", async () => {
+  const { arkiv, service } = setup();
+  const plan = await service.plan(1n);
+  const ids = BATCH(plan, 2);
+  await assert.rejects(service.recordSubmission(1n, { txHash: "0x" + "9".repeat(64), pending: ids }), /does not know/);
+  const foreign = arkiv.addTx({ from: STRANGER });
+  await assert.rejects(service.recordSubmission(1n, { txHash: foreign, pending: ids }), /not an Arkiv entity write from this campaign's business/);
+  const elsewhere = arkiv.addTx({ from: BUSINESS, to: "0x000000000000000000000000000000000000dEaD" });
+  await assert.rejects(service.recordSubmission(1n, { txHash: elsewhere, pending: ids }), /not an Arkiv entity write/);
+  assert.equal((await service.plan(1n)).payloads.length, 10, "nothing was held back by a bogus hash");
+});
+
 test("concurrent prepare calls share one run", async () => {
   const { swarm, service } = setup();
   const [a, b] = await Promise.all([service.prepare(1n), service.prepare(1n)]);

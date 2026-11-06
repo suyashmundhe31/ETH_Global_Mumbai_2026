@@ -32,8 +32,10 @@ signing-key-*.json
 # ---------------------------------------------------------------- runtime data
 # user-frontend: World ID nullifier <-> wallet store
 players.json
+players.json.tmp
 # worker: Arkiv / Swarm progress journal
 worker/data/*.json
+worker/data/*.tmp
 worker/data/tmp/
 
 # ---------------------------------------------------------------- contracts (Foundry)
@@ -70,13 +72,3 @@ desktop.ini
 *.swp
 *.swo
 *~
-
-# ---------------------------------------------------------------- Chainlink CRE (cre/)
-user-frontend/.env
-cre/.env
-cre/workflow/.env
-cre/out/
-cre/cache/
-cre/broadcast/
-.cre_build_tmp.js
-*.wasm
