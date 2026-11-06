@@ -10,7 +10,10 @@ const deny = (error: string, status = 400) => NextResponse.json({ error }, { sta
 
 export async function POST(req: Request) {
   const { idkitResponse, address, message, message_tag, signature } = await req.json();
-  if (!isAddress(address) || idkitResponse?.environment !== ENV) return deny("Verification failed");
+  if (!isAddress(address) || idkitResponse?.environment !== ENV) {
+    console.error("World ID environment mismatch", { expected: ENV, sent: idkitResponse?.environment });
+    return deny("Verification failed");
+  }
   const wallet = address.toLowerCase();
 
   // 1. The wallet really signed our challenge (proves ownership, not just an address).
@@ -18,11 +21,17 @@ export async function POST(req: Request) {
   const fresh = expires > Date.now() / 1000;
   const mine = typeof message === "string" && message.includes(`Wallet: ${wallet}\n`) && tagOk(message, message_tag ?? "");
   const owns = fresh && mine && (await verifyMessage({ address, message, signature }).catch(() => false));
-  if (!owns) return deny("Wallet signature check failed");
+  if (!owns) {
+    console.error("World ID login: wallet signature check failed", { fresh, mine });
+    return deny("Wallet signature check failed");
+  }
 
   // 2. The World ID proof was made for THIS wallet (signal = wallet address).
   const r = idkitResponse.responses?.[0];
-  if (r?.signal_hash !== hashSignal(wallet)) return deny("Proof is not bound to this wallet");
+  if (r?.signal_hash !== hashSignal(wallet)) {
+    console.error("World ID proof not bound to this wallet");
+    return deny("Proof is not bound to this wallet");
+  }
 
   // 3. World validates the proof. Never trust the client result alone.
   const res = await fetch(`https://developer.world.org/api/v4/verify/${RP_ID}`, {
@@ -30,8 +39,12 @@ export async function POST(req: Request) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ ...idkitResponse, environment: ENV }),
   }).catch(() => null);
-  const v = res?.ok ? await res.json() : null;
-  if (v?.success !== true || v?.environment !== ENV || !r?.nullifier) return deny("Verification failed");
+  const v = res ? await res.json().catch(() => null) : null;
+  if (!res?.ok || v?.success !== true || v?.environment !== ENV || !r?.nullifier) {
+    // Server log only (no secrets): World's reason for rejecting, to debug staging vs production mix-ups.
+    console.error("World ID verify rejected", { status: res?.status, expected: ENV, sent: idkitResponse?.environment, world: v });
+    return deny("Verification failed");
+  }
 
   // 4. One human <-> one wallet.
   let result;

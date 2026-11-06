@@ -32,3 +32,15 @@ export async function loginPlayer(nullifierHex: string, wallet: string) {
   await store.put(`wallet:${wallet}`, id);
   return { ok: true as const, id, isNew: true };
 }
+
+// Testing only (SKIP_WORLD_ID=true): link a signed-in wallet without a World ID proof.
+// The id is "test-<wallet>" so these players are easy to find and delete later.
+export async function linkTestPlayer(wallet: string) {
+  const store = await kv();
+  const existing = await store.get(`wallet:${wallet}`);
+  if (existing) return existing;
+  const id = `test-${wallet}`;
+  await store.put(`player:${id}`, JSON.stringify({ wallet, createdAt: new Date().toISOString() }));
+  await store.put(`wallet:${wallet}`, id);
+  return id;
+}
