@@ -10,12 +10,17 @@ export default function LoginButton() {
   const [wallet, setWallet] = useState("");
   const [proof, setProof] = useState({ message: "", message_tag: "", signature: "" });
   const [msg, setMsg] = useState("");
+  // No injected wallet (e.g. Safari on iPhone): link that reopens this page inside the MetaMask app's browser.
+  const [openInMetaMask, setOpenInMetaMask] = useState("");
 
   async function start() {
     setMsg("");
     try {
       const eth = (window as unknown as { ethereum?: Eth }).ethereum;
-      if (!eth) return setMsg("MetaMask not found");
+      if (!eth) {
+        setOpenInMetaMask(`https://metamask.app.link/dapp/${location.host}${location.pathname}`);
+        return setMsg("MetaMask not found in this browser. On a phone, open the game inside the MetaMask app:");
+      }
 
       // 1. Connect MetaMask
       const [address] = (await eth.request({ method: "eth_requestAccounts" })) as string[];
@@ -53,6 +58,11 @@ export default function LoginButton() {
     <>
       <button onClick={start}>Connect wallet &amp; verify with World ID</button>
       <p>{msg}</p>
+      {openInMetaMask && (
+        <p>
+          <a href={openInMetaMask}>🦊 Open in MetaMask</a>
+        </p>
+      )}
       {rp && (
         <IDKitRequestWidget
           open={open}

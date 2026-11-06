@@ -3,13 +3,18 @@
 // Campaign markers (one per campaign within 1 km that canSpawnFor allows) + the on-chain catch panel.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
 import mapboxgl from "mapbox-gl";
 import { fetchCreaturesNear, type Creature } from "@/lib/arkiv";
-import { CATCH_RADIUS, VISIBLE_RADIUS, visibleCampaigns } from "@/lib/campaigns";
+import { CATCH_RADIUS, VISIBLE_RADIUS, visibleCampaigns, type Campaign } from "@/lib/campaigns";
+import type { ARCatchOutcome } from "@/components/ARView";
 import { RARITIES, catchCreature, chainConfigured, spawnableCampaigns, type CatchPhase, type Caught } from "@/lib/chain";
 import type { Address } from "viem";
 import { createCampaignModels } from "@/lib/campaignModels";
 import ModelViewer from "@/components/ModelViewer";
+
+// Tilt-driven AR camera (split screen when the phone is upright). Browser only.
+const ARView = dynamic(() => import("@/components/ARView"), { ssr: false });
 
 const REFETCH_MOVE = 300; // m — refetch when the player is this far from the last fetch centre
 const REFETCH_EVERY = 60_000; // ms
@@ -212,25 +217,46 @@ export default function Campaigns({
     };
   }, []);
 
-  const onCatch = async () => {
-    if (!selected || busy) return;
+  /** The on-chain catch. Shared by the map's Catch button and a tap on a creature in the AR camera. */
+  const catchAt = async (target: Campaign): Promise<ARCatchOutcome> => {
+    if (busy) return "failed";
     setCatchError("");
-    const target = selected;
     const at = getPlayerPos(); // CRE checks this against the campaign's on-chain spawn point
     try {
       const caught = await catchCreature(wallet as Address, target.campaignId, at.lat, at.lng, setPhase);
-      if (caught) {
-        const own = target.creatures.find((c) => c.creatureId === caught.creatureId.toString());
-        setResult({ ...caught, businessName: target.businessName, description: target.discountDescription, modelUrl: own?.modelUrl ?? target.modelUrl });
-        setSelectedId(null);
-        void load(getPlayerPos()); // canSpawnFor is now false for this campaign
-      }
+      if (!caught) return "missed";
+      const own = target.creatures.find((c) => c.creatureId === caught.creatureId.toString());
+      setResult({ ...caught, businessName: target.businessName, description: target.discountDescription, modelUrl: own?.modelUrl ?? target.modelUrl });
+      setSelectedId(null);
+      void load(getPlayerPos()); // canSpawnFor is now false for this campaign
+      return "caught";
     } catch (err) {
       setPhase(null);
       setCatchError(err instanceof Error ? err.message.split("\n")[0] : "Catch failed.");
+      return "failed";
     }
   };
+  const onCatch = () => {
+    if (selected) void catchAt(selected);
+  };
 
+  const status = busy && phase ? PHASE_LABEL[phase] : catchError || (phase && phase !== "caught" ? PHASE_LABEL[phase] : "");
+  return (
+    <>
+      {renderPanel()}
+      <ARView
+        map={map}
+        campaign={selected}
+        canCatch={!!selected && dist(selected) <= CATCH_RADIUS}
+        distanceLabel={selected ? fmtDist(dist(selected)) : ""}
+        status={status}
+        onCatch={() => (selected ? catchAt(selected) : Promise.resolve("failed"))}
+      />
+    </>
+  );
+
+  // The map's bottom card: catch result, the selected campaign with its Catch button, or "nothing nearby".
+  function renderPanel() {
   if (result) {
     const rarity = RARITIES[result.rarity] ?? "COMMON";
     const color = RARITY_COLOR[rarity];
@@ -297,4 +323,5 @@ export default function Campaigns({
       {catchError && <div style={{ marginTop: 8, color: "#fca5a5", fontSize: 14 }}>{catchError}</div>}
     </div>
   );
+  }
 }
