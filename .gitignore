@@ -22,6 +22,9 @@ next-env.d.ts
 .env
 .env.*
 !.env.example
+frontend/.env
+cre/.env
+cre/workflow/.env
 
 # Logs
 npm-debug.log*
@@ -54,3 +57,10 @@ desktop.ini
 *.swp
 *.swo
 *~
+# Foundry (cre/)
+cre/out/
+cre/cache/
+cre/broadcast/
+# CRE build leftovers
+.cre_build_tmp.js
+*.wasm

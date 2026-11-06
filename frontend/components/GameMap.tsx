@@ -4,6 +4,8 @@ import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { createPlayer } from "@/lib/player";
+import Campaigns from "@/components/Campaigns";
+import Collection from "@/components/Collection";
 import { ROAD_OFFSETS, buildStreetlights } from "@/lib/streetlights";
 import { drawFacade, facadeLighting, facadePixelRatio, lightPresetFor, type FacadeType, type LightPreset } from "@/lib/facades";
 
@@ -28,7 +30,7 @@ const BUTTON: React.CSSProperties = {
   touchAction: "manipulation",
 };
 
-export default function GameMap() {
+export default function GameMap({ wallet }: { wallet: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<LightMode>("auto");
   const modeRef = useRef<LightMode>("auto");
@@ -37,6 +39,7 @@ export default function GameMap() {
   const [devMode, setDevMode] = useState(process.env.NODE_ENV !== "production");
   const devModeRef = useRef(devMode);
   const playerRef = useRef<ReturnType<typeof createPlayer> | null>(null);
+  const [world, setWorld] = useState<{ map: mapboxgl.Map; getPlayerPos: () => mapboxgl.LngLat } | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -312,8 +315,9 @@ export default function GameMap() {
 
       // --- Player avatar (three.js custom layer, drawn on top) ---
       const player = createPlayer(map, devModeRef.current);
-      map.addLayer(player.layer);
       playerRef.current = player;
+      map.addLayer(player.layer);
+      setWorld({ map, getPlayerPos: player.getPosition });
     });
 
     return () => {
@@ -322,6 +326,7 @@ export default function GameMap() {
       clearInterval(clock);
       playerRef.current?.destroy();
       playerRef.current = null;
+      setWorld(null);
       map.remove();
     };
   }, []);
@@ -339,6 +344,8 @@ export default function GameMap() {
   return (
     <>
       <div ref={containerRef} style={{ position: "fixed", inset: 0 }} />
+      {world && <Campaigns map={world.map} getPlayerPos={world.getPlayerPos} wallet={wallet} />}
+      <Collection wallet={wallet} />
       <button
         type="button"
         aria-label="Switch time of day"

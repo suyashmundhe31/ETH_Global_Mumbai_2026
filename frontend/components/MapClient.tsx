@@ -38,5 +38,5 @@ export default function MapClient({ wallet }: { wallet: string }) {
     return () => eth.removeListener?.("accountsChanged", check);
   }, [wallet]);
 
-  return ok ? <GameMap /> : null;
+  return ok ? <GameMap wallet={wallet} /> : null;
 }

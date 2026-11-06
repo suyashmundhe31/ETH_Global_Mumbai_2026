@@ -1,0 +1,28 @@
+# CRE workflow settings per target (see ../project.yaml for RPCs).
+staging-settings:
+  user-workflow:
+    workflow-name: "creature-referee-staging"
+    deployment-registry: "onchain:ethereum-mainnet"
+  workflow-artifacts:
+    workflow-path: "./main.ts"
+    config-path: "./config.json"
+    secrets-path: "../secrets.yaml"
+
+production-settings:
+  user-workflow:
+    workflow-name: "creature-referee"
+    deployment-registry: "onchain:ethereum-mainnet"
+  workflow-artifacts:
+    workflow-path: "./main.ts"
+    config-path: "./config.json"
+    secrets-path: "../secrets.yaml"
+
+# Local anvil fork used by sim-fork.sh (which passes its own --config and -e).
+fork-settings:
+  user-workflow:
+    workflow-name: "creature-referee-fork"
+    deployment-registry: "onchain:ethereum-mainnet"
+  workflow-artifacts:
+    workflow-path: "./main.ts"
+    config-path: "./config.json"
+    secrets-path: "../secrets.yaml"
