@@ -79,10 +79,15 @@
 
     <section class="panel results" id="results" hidden>
       <h2>Generated creatures</h2>
-      <div class="actions"><button id="retryPersistBtn" type="button" hidden>Retry missing Arkiv entities</button></div>
+      <div class="actions">
+        <button id="arkivSignBtn" type="button" hidden>Sign missing creatures on Arkiv (business wallet)</button>
+        <button id="revealCodesBtn" type="button">Reveal discount codes (sign with business wallet)</button>
+      </div>
+      <p class="hint">Discount codes are stored encrypted on-chain and on Arkiv. Only the worker holds the key; it
+        decrypts for the campaign's business wallet (or a creature's Arkiv owner) after a signed request.</p>
       <table>
         <thead>
-          <tr><th>#</th><th>Creature ID</th><th>Rarity</th><th>Discount code</th><th>Arkiv entity</th><th>Swarm reference</th></tr>
+          <tr><th>#</th><th>Creature ID</th><th>Rarity</th><th>Discount code</th><th>Arkiv entity</th><th>$owner</th><th>Swarm reference</th></tr>
         </thead>
         <tbody id="creatureRows"></tbody>
       </table>

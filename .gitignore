@@ -1,0 +1,26 @@
+# env / secrets
+.env
+.env.local
+*.env
+!.env.example
+
+# node
+node_modules/
+dist/
+
+# foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/*/31337/
+contracts/deployments/31337.json
+
+# worker runtime state
+worker/data/*.json
+worker/data/tmp/
+
+.DS_Store
+contracts/deployments/31338.json
+contracts/broadcast/*/31338/
+
+.claude
+deployments

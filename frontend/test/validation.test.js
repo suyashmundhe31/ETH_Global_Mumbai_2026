@@ -64,3 +64,11 @@ test("future expiration converts to unix seconds", () => {
   f.expiration = new Date((NOW + 86400) * 1000).toISOString();
   assert.equal(validateCampaign(f, NOW).input.expiresAt, BigInt(NOW + 86400));
 });
+
+test("discount codes are limited to 16 bytes (so the encrypted code fits the contract)", () => {
+  const f = valid();
+  f.rewards.EPIC.code = "SUMMER2026-VIP16"; // exactly 16
+  assert.deepEqual(validateCampaign(f, NOW).errors, []);
+  f.rewards.EPIC.code = "SUMMER2026-VIP-17";
+  assert.match(validateCampaign(f, NOW).errors.join(" "), /EPIC discount code must be at most 16 bytes/);
+});

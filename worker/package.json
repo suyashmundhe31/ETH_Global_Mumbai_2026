@@ -1,0 +1,27 @@
+{
+  "name": "creature-campaign-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.22.0",
+    "npm": "10.9.4"
+  },
+  "packageManager": "npm@10.9.4",
+  "description": "Backend worker: Swarm uploads, chain event processing and idempotent Arkiv persistence for creature campaigns",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test \"test/*.test.js\"",
+    "e2e": "node e2e/local.e2e.js",
+    "demo": "node scripts/demo-campaign.js",
+    "gen-code-key": "node scripts/generate-code-key.js"
+  },
+  "dependencies": {
+    "@arkiv-network/sdk": "1.0.1",
+    "@ethersphere/bee-js": "13.2.0",
+    "viem": "2.57.16"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}

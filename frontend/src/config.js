@@ -33,5 +33,12 @@ export async function loadConfig() {
     vrfMode: remote.vrfMode || "unknown",
     swarmGateway: remote.swarmGateway || "",
     arkivExplorer: remote.arkivExplorer || "",
+    // Arkiv chain the business signs creature entities on (from the worker; schema is shared code).
+    arkivNetwork: remote.arkivNetwork || "rabdi",
+    arkivSchema: remote.arkivSchema || undefined,
+    arkivRpcUrl: remote.arkivRpcUrl || null,
+    // Optional. Arkiv access keys are not secrets (they ship with any app, per the SDK docs) but
+    // restrict yours to your origins at hub.arkiv.network. Empty = public, rate-limited endpoint.
+    arkivAccessKey: env.VITE_ARKIV_ACCESS_KEY || "",
   };
 }

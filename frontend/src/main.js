@@ -5,9 +5,11 @@ import markerIcon from "leaflet/dist/images/marker-icon.png";
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
 import markerShadow from "leaflet/dist/images/marker-shadow.png";
 import { api } from "./api.js";
+import { arkivChainFor, ensureArkivNetwork, isUserRejection, metaMaskArkivWallet, writeCreatureBatches } from "./arkivWrite.js";
 import { loadConfig } from "./config.js";
 import "./style.css";
-import { RARITIES, validateCampaign } from "./validation.js";
+import { revealMessage } from "../../shared/discountCodes.js";
+import { LIMITS, RARITIES, validateCampaign } from "./validation.js";
 import { connectWallet, createCampaign, readCampaign, retryRandomness } from "./wallet.js";
 
 const $ = (id) => document.getElementById(id);
@@ -23,10 +25,11 @@ let busy = false;
 const STEP_DEFS = [
   ["validate", "Validate campaign"],
   ["wallet", "Connect MetaMask & check network"],
+  ["encrypt", "Encrypt discount codes (worker key; only ciphertext goes on-chain and to Arkiv)"],
   ["swarm", "Upload .glb to Swarm"],
   ["tx", "Submit createCampaign transaction"],
   ["vrf", "Chainlink VRF fulfilment + on-chain Fisher–Yates allocation"],
-  ["arkiv", "Persist one Arkiv entity per creature"],
+  ["arkiv", "Business signs one Arkiv entity per creature ($creator = $owner = business wallet)"],
 ];
 function resetSteps() {
   $("steps").innerHTML = STEP_DEFS.map(([k, t]) => `<li id="step-${k}" class="pending"><b>${t}</b><span></span></li>`).join("");
@@ -43,7 +46,7 @@ function step(k, state, detail = "") {
 function buildForm() {
   $("rewardRows").innerHTML = RARITIES.map(
     (r) => `<tr><td class="r-${r}">${r}</td>
-      <td><input id="code-${r}" maxlength="64" placeholder="${r.slice(0, 3)}10" /></td>
+      <td><input id="code-${r}" maxlength="${LIMITS.code}" placeholder="${r.slice(0, 3)}10" /></td>
       <td><input id="desc-${r}" maxlength="128" placeholder="Reward for ${r.toLowerCase()} creatures" /></td></tr>`,
   ).join("");
   const defaults = { COMMON: 6, RARE: 2, EPIC: 1, LEGENDARY: 1 };
@@ -179,14 +182,23 @@ async function launch(ev) {
     await doConnect();
     step("wallet", "done", `${short(conn.address, 6)} on ${cfg.chainName}`);
 
+    // 3. Encrypt the discount codes with the worker's key (bound to this business + rarity).
+    step("encrypt", "active");
+    const { codes: encryptedCodes } = await api.encryptCodes({
+      business: conn.address,
+      codes: RARITIES.map((r) => form.rewards[r].code.trim()),
+    });
+    step("encrypt", "done", `${encryptedCodes.filter(Boolean).length} code(s) encrypted · plaintext never leaves the worker`);
+
     // 3. Swarm upload (must succeed before anything goes on-chain)
     step("swarm", "active", `uploading ${esc(form.asset)}…`);
     const up = await api.uploadToSwarm(form.asset);
     step("swarm", "done", `reference <code>${short(up.reference, 8)}</code> (download verified)`);
     showSwarmModel(up.reference);
 
-    // 4. Contract transaction
+    // 4. Contract transaction (with the encrypted codes)
     const { input } = validateCampaign({ ...form, swarmReference: up.reference });
+    input.rewards = input.rewards.map((r, i) => ({ ...r, code: encryptedCodes[i] }));
     step("tx", "active", "confirm in MetaMask…");
     const tx = await createCampaign(conn, cfg.campaignManager, input);
     step("tx", "done", `campaign #${tx.campaignId} · tx ${txLink(tx.hash)}`);
@@ -194,12 +206,14 @@ async function launch(ev) {
     // 5. Wait for VRF callback + allocation
     await waitForAllocation(tx.campaignId, tx.requestId);
 
-    // 6. Arkiv persistence (the worker also picks this up from the RarityAllocated event)
-    await waitForPersistence(tx.campaignId, true);
+    // 6. Arkiv: the worker prepares the payloads, the business signs them in MetaMask
+    await createArkivEntities(tx.campaignId);
   } catch (err) {
     const active = document.querySelector("#steps li.active");
-    if (active) step(active.id.replace("step-", ""), "error", esc(err.shortMessage || err.message));
-    else $("formErrors").innerHTML = `<li>${esc(err.shortMessage || err.message)}</li>`;
+    const msg = isUserRejection(err) ? "rejected in MetaMask" : err.shortMessage || err.message;
+    if (active) step(active.id.replace("step-", ""), "error", esc(msg));
+    else $("formErrors").innerHTML = `<li>${esc(msg)}</li>`;
+    if (active?.id === "step-arkiv") $("arkivSignBtn").hidden = false; // the campaign exists; only Arkiv is left
   } finally {
     busy = false;
     $("launchBtn").disabled = false;
@@ -234,26 +248,92 @@ async function waitForAllocation(campaignId, requestId) {
   }
 }
 
-async function waitForPersistence(campaignId, trigger) {
-  currentCampaignId = campaignId;
-  step("arkiv", "active", "starting…");
-  if (trigger) await api.persist(campaignId).catch(() => {});
+/** Waits until the worker has the per-creature Swarm assets, then returns what is left to sign. */
+async function waitForPlan(campaignId) {
   for (;;) {
-    const view = await api.campaign(campaignId);
-    renderCampaign(view);
-    const p = view.persistence;
-    if (p.status === "COMPLETE") {
-      step("arkiv", "done", `${p.stored}/${view.onChain.totalCreatures} entities verified in Arkiv`);
-      return view;
+    try {
+      return await api.arkivPlan(campaignId);
+    } catch (err) {
+      if (err.status !== 409) throw err;
+      step("arkiv", "active", `preparing per-creature Swarm models · ${esc(err.message)}`);
+      await sleep(3000);
     }
-    if (p.status === "PARTIAL") {
-      step("arkiv", "error", `${p.stored}/${view.onChain.totalCreatures} stored · ${p.missing.length} missing · ${esc(p.lastError || "")}`);
-      $("retryPersistBtn").hidden = false;
-      return view;
-    }
-    step("arkiv", "active", `${p.status.toLowerCase()} · ${p.stored ?? 0}/${view.onChain.totalCreatures}`);
-    await sleep(3000);
   }
+}
+
+/**
+ * The business creates its creatures on Arkiv. Only creatures without a valid entity are in the
+ * plan, so running this again after any failure (the "Retry" button) never creates duplicates.
+ */
+async function createArkivEntities(campaignId) {
+  currentCampaignId = campaignId;
+  $("arkivSignBtn").hidden = true;
+  step("arkiv", "active", "preparing per-creature Swarm models…");
+  const plan = await waitForPlan(campaignId);
+  renderCampaign(await api.campaign(campaignId));
+  if (plan.payloads.length === 0) return verifyArkiv(campaignId);
+
+  if (!conn) await doConnect();
+  if (conn.address.toLowerCase() !== plan.business.toLowerCase()) {
+    throw new Error(`Switch MetaMask to the business wallet of this campaign (${plan.business}); it must sign the creatures.`);
+  }
+  const chain = arkivChainFor({ network: cfg.arkivNetwork, accessKey: cfg.arkivAccessKey, rpcUrl: cfg.arkivRpcUrl });
+  step("arkiv", "active", `switch MetaMask to Arkiv ${esc(chain.name)}…`);
+  await ensureArkivNetwork(window.ethereum, chain);
+  const balance = BigInt(await window.ethereum.request({ method: "eth_getBalance", params: [conn.address, "latest"] }));
+  if (balance === 0n) {
+    throw new Error(`The business wallet has no ${chain.nativeCurrency.symbol} on Arkiv ${chain.name}. Get some at https://hub.arkiv.network/faucet, then retry.`);
+  }
+
+  const batches = Math.ceil(plan.payloads.length / plan.batchSize);
+  let signed = 0;
+  step("arkiv", "active", `${plan.stored}/${plan.total} on Arkiv · confirm ${batches} transaction(s) in MetaMask…`);
+  const wallet = metaMaskArkivWallet(window.ethereum, conn.address, chain);
+  const result = await writeCreatureBatches({
+    walletClient: wallet,
+    plan,
+    schemaName: cfg.arkivSchema,
+    onBatch: async (r) => {
+      signed++;
+      if (r.ok) await api.arkivSubmissions(campaignId, { txHash: r.txHash, entries: r.entries }).catch(() => {});
+      step("arkiv", "active", `batch ${signed}/${batches} ${r.ok ? "written" : "failed"} · ${r.ok ? "" : esc(r.error.shortMessage || r.error.message)}`);
+    },
+  });
+  if (result.rejected) step("arkiv", "active", "signature rejected in MetaMask · verifying what was written…");
+  return verifyArkiv(campaignId);
+}
+
+/** Verification is done by the worker against Arkiv itself ($creator must be the business). */
+async function verifyArkiv(campaignId) {
+  step("arkiv", "active", "verifying on Arkiv…");
+  let report;
+  for (let i = 0; i < 5; i++) {
+    report = await api.arkivVerify(campaignId);
+    if (report.status === "COMPLETE") break;
+    await sleep(2000); // the query index can trail the latest block slightly
+  }
+  renderCampaign(await api.campaign(campaignId));
+  if (report.status === "COMPLETE") {
+    step("arkiv", "done", `${report.stored}/${report.expected} entities · $creator = $owner = <code>${short(report.creator, 6)}</code>`);
+  } else {
+    step("arkiv", "error", `${report.stored}/${report.expected} on Arkiv · ${report.missing.length} missing`);
+    $("arkivSignBtn").hidden = false;
+  }
+  return report;
+}
+
+/** Deep link / reload: show the state; signing needs a click (it opens MetaMask). */
+async function showExistingCampaign(campaignId) {
+  currentCampaignId = campaignId;
+  // Re-check Arkiv itself (read-only) so the page never shows a stale result.
+  await api.arkivVerify(campaignId).catch(() => {});
+  const view = await api.campaign(campaignId);
+  renderCampaign(view);
+  const a = view.arkiv;
+  if (view.onChain.status !== "ALLOCATED") return step("arkiv", "pending", "waiting for VRF allocation");
+  if (a.status === "COMPLETE") return step("arkiv", "done", `${a.stored}/${view.onChain.totalCreatures} entities · $creator = $owner = <code>${short(a.creator, 6)}</code>`);
+  step("arkiv", "error", `${a.stored}/${view.onChain.totalCreatures} on Arkiv · the business wallet must sign the rest`);
+  $("arkivSignBtn").hidden = false;
 }
 
 function txLink(hash) {
@@ -261,7 +341,30 @@ function txLink(hash) {
   return cfg.explorerUrl ? `<a href="${cfg.explorerUrl}/tx/${hash}" target="_blank" rel="noreferrer"><code>${short(hash, 8)}</code></a>` : `<code>${short(hash, 8)}</code>`;
 }
 
+// Plaintext codes revealed in this page session (never persisted): { campaignId, byRarity }
+let revealed = null;
+let lastView = null;
+
+function codeCell(campaignId, c) {
+  if (!c.discountCodeEncrypted) return `<code>${esc(c.discountCode)}</code> <small title="Created before encryption">(public)</small>`;
+  const plain = revealed?.campaignId === String(campaignId) ? revealed.byRarity[c.rarity] : undefined;
+  return plain !== undefined ? `<code>${esc(plain)}</code>` : `<span title="${esc(c.discountCode)}">🔒 encrypted</span>`;
+}
+
+/** The business signs a message (no gas, no transaction); the worker verifies it and decrypts. */
+async function revealCodes() {
+  if (currentCampaignId === null) return;
+  if (!conn) await doConnect();
+  const issuedAt = new Date().toISOString();
+  const message = revealMessage({ chainId: cfg.chainId, contract: cfg.campaignManager, campaignId: currentCampaignId, address: conn.address, issuedAt });
+  const signature = await conn.wallet.signMessage({ account: conn.address, message });
+  const res = await api.revealCodes(currentCampaignId, { address: conn.address, issuedAt, signature });
+  revealed = { campaignId: String(currentCampaignId), byRarity: Object.fromEntries(res.codes.map((c) => [c.rarity, c.code])) };
+  if (lastView) renderCampaign(lastView);
+}
+
 function renderCampaign(v) {
+  lastView = v;
   const oc = v.onChain;
   const counts = oc.rarityCounts.map((n, i) => `${RARITIES[i]}: ${n}`).join(" · ");
   const exp = Number(oc.expiresAt) ? new Date(Number(oc.expiresAt) * 1000).toLocaleString() : "none";
@@ -273,7 +376,7 @@ function renderCampaign(v) {
       <dt>Rarity distribution</dt><dd>${counts}</dd>
       <dt>Creation tx</dt><dd>${txLink(v.txs.creationTxHash)}</dd>
       <dt>VRF</dt><dd>${esc(oc.status)} · request ${esc(oc.vrfRequestId)} · fulfilment tx ${txLink(v.txs.allocationTxHash)}</dd>
-      <dt>Arkiv</dt><dd>${esc(v.persistence.status)} · ${v.persistence.stored}/${oc.totalCreatures} · owner <code>${short(v.persistence.arkivOwner, 6)}</code> · expiry: ${esc(v.persistence.expirationMode || "—")}</dd>
+      <dt>Arkiv</dt><dd>${esc(v.arkiv.status)} · ${v.arkiv.stored}/${oc.totalCreatures} · $creator = $owner = <code>${short(v.arkiv.creator, 6)}</code> · schema <code>${esc(v.arkiv.schema)}</code> · expiry: ${esc(v.arkiv.expirationMode || "—")}</dd>
       <dt>Campaign Swarm ref</dt><dd><a href="#" data-swarm="${esc(oc.swarmReference)}"><code>${short(oc.swarmReference, 8)}</code></a></dd>
       <dt>Expires</dt><dd>${exp}</dd>
     </dl>`;
@@ -285,8 +388,9 @@ function renderCampaign(v) {
           <td>${c.index}</td>
           <td><code>${esc(c.creatureId)}</code></td>
           <td class="r-${c.rarity}">${c.rarity}</td>
-          <td><code>${esc(c.discountCode)}</code></td>
+          <td>${codeCell(v.campaignId, c)}</td>
           <td>${c.arkivEntityKey ? `<code title="${esc(c.arkivEntityKey)}">${short(c.arkivEntityKey, 8)}</code>` : `<em>${esc(c.arkivStatus)}</em>`}</td>
+          <td>${c.arkivOwner ? `<code title="${esc(c.arkivOwner)}">${short(c.arkivOwner, 6)}</code>` : "—"}</td>
           <td>${c.swarmReference ? `<a href="#" data-swarm="${esc(c.swarmReference)}"><code>${short(c.swarmReference, 8)}</code></a>` : "—"}</td>
         </tr>`,
       )
@@ -305,9 +409,20 @@ async function boot() {
   $("asset").addEventListener("change", showLocalModel);
   $("connectBtn").addEventListener("click", () => doConnect().catch((e) => alert(e.message)));
   $("campaignForm").addEventListener("submit", launch);
-  $("retryPersistBtn").addEventListener("click", async () => {
-    $("retryPersistBtn").hidden = true;
-    if (currentCampaignId !== null) await waitForPersistence(currentCampaignId, true);
+  $("revealCodesBtn").addEventListener("click", () =>
+    revealCodes().catch((e) => alert(isUserRejection(e) ? "Signature rejected in MetaMask" : e.shortMessage || e.message)),
+  );
+  $("arkivSignBtn").addEventListener("click", async () => {
+    if (currentCampaignId === null || busy) return;
+    busy = true;
+    try {
+      await createArkivEntities(currentCampaignId);
+    } catch (err) {
+      step("arkiv", "error", esc(isUserRejection(err) ? "signature rejected in MetaMask" : err.shortMessage || err.message));
+      $("arkivSignBtn").hidden = false;
+    } finally {
+      busy = false;
+    }
   });
   document.addEventListener("click", (e) => {
     const a = e.target.closest("[data-swarm]");
@@ -318,7 +433,7 @@ async function boot() {
   });
   // Deep link: ?campaign=<id> re-opens the status view of an existing campaign.
   const id = new URLSearchParams(location.search).get("campaign");
-  if (id && /^\d+$/.test(id)) waitForPersistence(BigInt(id), false).catch((e) => step("arkiv", "error", esc(e.message)));
+  if (id && /^\d+$/.test(id)) showExistingCampaign(BigInt(id)).catch((e) => step("arkiv", "error", esc(e.message)));
 }
 
 boot();

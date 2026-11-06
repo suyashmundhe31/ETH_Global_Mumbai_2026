@@ -1,7 +1,11 @@
 // Pure campaign-form validation (no DOM, no wallet) so it can be unit tested with node:test.
 // Limits mirror CreatureCampaignManager.sol; the contract re-validates everything on-chain.
+// Discount codes are encrypted before they go on-chain, so the plaintext limit is the one that keeps
+// the ciphertext within the contract's 64 bytes (see shared/discountCodes.js).
+import { MAX_PLAINTEXT_CODE_BYTES } from "../../shared/discountCodes.js";
+
 export const RARITIES = ["COMMON", "RARE", "EPIC", "LEGENDARY"];
-export const LIMITS = { maxCreatures: 500, name: 64, code: 64, description: 128 };
+export const LIMITS = { maxCreatures: 500, name: 64, code: MAX_PLAINTEXT_CODE_BYTES, description: 128 };
 const SWARM_REF = /^[0-9a-fA-F]{64}([0-9a-fA-F]{64})?$/;
 
 const utf8Len = (s) => new TextEncoder().encode(s).length;

@@ -1,12 +1,13 @@
-// Generates small, valid glTF 2.0 binary (.glb) creature models into assets/creatures/.
+// Generates small, valid glTF 2.0 binary (.glb) creature models.
 // Pure Node.js (no dependencies) so it runs identically on Windows, Linux and macOS.
-//   node scripts/generate-creature-glb.mjs
+//   node scripts/generate-creature-glb.mjs [outDir]     (default: assets/creatures)
+// The worker's tests use copies in worker/test/fixtures/ (independent of your own assets).
 import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const outDir = join(root, "assets", "creatures");
+const outDir = process.argv[2] ? resolve(process.argv[2]) : join(root, "assets", "creatures");
 
 function sphere(cx, cy, cz, rx, ry, rz, seg = 24, rings = 16) {
   const pos = [], nrm = [], idx = [];
@@ -124,5 +125,5 @@ mkdirSync(outDir, { recursive: true });
 for (const [file, prims] of Object.entries(models)) {
   const glb = buildGlb(file.replace(".glb", ""), prims);
   writeFileSync(join(outDir, file), glb);
-  console.log(`wrote ${join("assets", "creatures", file)} (${glb.length} bytes)`);
+  console.log(`wrote ${relative(root, join(outDir, file))} (${glb.length} bytes)`);
 }
