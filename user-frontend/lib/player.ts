@@ -219,6 +219,7 @@ export function createPlayer(map: mapboxgl.Map, devMode: boolean) {
 
   return {
     layer,
+    getPosition: () => pos,
     setDevMode(on: boolean) {
       if (on === dev) return;
       dev = on;

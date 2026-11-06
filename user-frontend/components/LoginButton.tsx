@@ -42,7 +42,7 @@ export default function LoginButton() {
       setProof({ message: s.message, message_tag: s.message_tag, signature });
       setRp({ rp_id: process.env.NEXT_PUBLIC_WORLD_RP_ID!, nonce: s.nonce, created_at: s.created_at, expires_at: s.expires_at, signature: s.sig });
       setOpen(true);
-        } catch (e) {
+    } catch (e) {
       console.error(e);
       const err = e as { code?: number; message?: string };
       setMsg(err.code === 4001 ? "Wallet request rejected" : `Error: ${err.message ?? e}`);

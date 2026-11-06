@@ -1,6 +1,5 @@
 import { Suspense } from "react";
 import { currentPlayer } from "@/lib/currentPlayer";
-   import CreatureList from "@/components/CreatureList";
 import LoginButton from "@/components/LoginButton";
 import MapClient from "@/components/MapClient";
 import NavBar from "@/components/NavBar";
