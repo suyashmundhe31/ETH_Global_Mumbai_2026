@@ -26,6 +26,8 @@ export class NotAllocatedError extends Error {}
 export class NotReadyError extends Error {}
 
 const HEX_KEY = /^0x[0-9a-fA-F]{64}$/;
+// Arkiv's native entity-operation address (arkiv router recipe; SDK ARKIV_ADDRESS).
+export const ARKIV_ENTITY_ADDRESS = "0x4400000000000000000000000000000000000044";
 const sameAddress = (a, b) => typeof a === "string" && typeof b === "string" && a.toLowerCase() === b.toLowerCase();
 
 export class CampaignArkivService {
@@ -37,8 +39,8 @@ export class CampaignArkivService {
    * @param {import('./state.js').JsonStateStore} deps.state
    * @param {(expiresAtUnix: bigint) => {mode: string}} deps.expirationFor
    */
-  constructor({ chain, swarm, arkiv, state, expirationFor, batchSize = 10, logger }) {
-    Object.assign(this, { chain, swarm, arkiv, state, expirationFor, batchSize });
+  constructor({ chain, swarm, arkiv, state, expirationFor, batchSize = 10, settler = null, logger }) {
+    Object.assign(this, { chain, swarm, arkiv, state, expirationFor, batchSize, settler });
     this.log = logger || createLogger("arkiv-campaigns");
     this._preparing = new Map();
   }
@@ -132,9 +134,12 @@ export class CampaignArkivService {
       if (!r.prepared) throw new NotReadyError(`Swarm assets ready for ${r.ready}/${r.total} creatures; retrying`);
     }
     const { campaign, creatures, total } = await this._allocated(campaignId);
-    const st = this.state.getCampaign(key);
     const { valid } = await this._reconcile(key, campaignId, campaign, creatures);
-    const missing = creatures.filter((c) => !valid.has(c.creatureId.toString()));
+    // arkiv-write-safety: a creature whose earlier transaction may still land is never planned again.
+    const pending = await this._unresolvedTransactions(key, valid);
+    const held = new Set(pending.flatMap((p) => p.creatureIds));
+    const st = this.state.getCampaign(key);
+    const missing = creatures.filter((c) => !valid.has(c.creatureId.toString()) && !held.has(c.creatureId.toString()));
     const payloads = missing.map((c) =>
       buildCreaturePayload({
         creature: c,
@@ -156,23 +161,75 @@ export class CampaignArkivService {
       total,
       stored: valid.size,
       payloads,
+      // Transactions whose outcome is not settled yet: their creatures are held back, not re-planned.
+      pending,
+      // Approval / Auto settle, inferred from who owns the entities already written (null = none yet, the
+      // business chooses). A campaign never mixes modes: the page follows this once it is known.
+      settlement: { mode: inferSettlementMode(valid, campaign.business, this.settler), settler: this.settler },
     };
   }
 
-  /** Records the keys a business transaction created (reported by the browser; verified later). */
-  async recordSubmission(campaignId, { txHash, entries }) {
+  /**
+   * Creatures held back because an earlier business transaction for them is still pending or was
+   * applied but is not yet visible. Released only when Arkiv shows the transaction reverted or
+   * the node no longer knows it (dropped).
+   */
+  async _unresolvedTransactions(key, valid) {
+    const byHash = new Map();
+    for (const [creatureId, rec] of Object.entries(this.state.getCampaign(key)?.creatures || {})) {
+      if (!rec.pendingTxHash) continue;
+      if (valid.has(creatureId)) {
+        this.state.updateCreature(key, creatureId, { pendingTxHash: null });
+        continue;
+      }
+      byHash.set(rec.pendingTxHash, [...(byHash.get(rec.pendingTxHash) || []), creatureId]);
+    }
+    const unresolved = [];
+    for (const [txHash, creatureIds] of byHash) {
+      const status = await this.arkiv.transactionStatus(txHash);
+      if (status === "pending" || status === "success") unresolved.push({ txHash, status, creatureIds });
+      else for (const id of creatureIds) this.state.updateCreature(key, id, { pendingTxHash: null, arkivStatus: "MISSING" });
+    }
+    return unresolved;
+  }
+
+  /**
+   * Records what a business transaction did, as reported by the browser:
+   *  - entries: creatureId -> entityKey of a confirmed batch (re-read from Arkiv before it counts)
+   *  - pending: creatureIds of a batch whose outcome is uncertain (sent, receipt unknown). The hash
+   *    must be a real Arkiv transaction from the campaign's business to the entity address.
+   */
+  async recordSubmission(campaignId, { txHash, entries, pending }) {
     const key = this.key(campaignId);
     const st = this.state.getCampaign(key);
     if (!st) throw new NotReadyError(`Campaign ${campaignId} has not been prepared`);
-    if (!Array.isArray(entries) || entries.length === 0) throw new TypeError("entries must be a non-empty array");
     const total = BigInt(st.totalCreatures);
+    const checkId = (raw) => {
+      const id = BigInt(String(raw));
+      if (id >> 32n !== BigInt(campaignId) || (id & 0xffffffffn) >= total) throw new TypeError(`creature ${raw} is not part of campaign ${campaignId}`);
+      return id.toString();
+    };
+
+    if (pending !== undefined) {
+      if (!Array.isArray(pending) || pending.length === 0) throw new TypeError("pending must be a non-empty array of creature IDs");
+      if (!HEX_KEY.test(String(txHash))) throw new TypeError("txHash is required for a pending batch");
+      const ids = pending.map(checkId);
+      const tx = await this.arkiv.getTransaction(txHash);
+      if (!tx) throw new TypeError(`Arkiv does not know transaction ${txHash}`);
+      if (!sameAddress(tx.from, st.business) || !sameAddress(tx.to, ARKIV_ENTITY_ADDRESS)) {
+        throw new TypeError("Transaction is not an Arkiv entity write from this campaign's business");
+      }
+      for (const id of ids) this.state.updateCreature(key, id, { pendingTxHash: txHash, arkivStatus: "PENDING_TX" });
+      return { recorded: ids.length, pending: true };
+    }
+
+    if (!Array.isArray(entries) || entries.length === 0) throw new TypeError("entries must be a non-empty array");
     for (const e of entries) {
-      const id = BigInt(String(e.creatureId));
-      if (id >> 32n !== BigInt(campaignId) || (id & 0xffffffffn) >= total) throw new TypeError(`creature ${e.creatureId} is not part of campaign ${campaignId}`);
+      checkId(e.creatureId);
       if (!HEX_KEY.test(String(e.entityKey))) throw new TypeError(`invalid entity key for creature ${e.creatureId}`);
     }
     for (const e of entries) {
-      this.state.updateCreature(key, String(e.creatureId), { submittedKey: e.entityKey, arkivTxHash: txHash ?? null, arkivStatus: "SUBMITTED" });
+      this.state.updateCreature(key, String(e.creatureId), { submittedKey: e.entityKey, arkivTxHash: txHash ?? null, arkivStatus: "SUBMITTED", pendingTxHash: null });
     }
     return { recorded: entries.length };
   }
@@ -189,6 +246,7 @@ export class CampaignArkivService {
         arkivEntityKey: entries[0].key,
         arkivOwner: entries[0].owner,
         arkivStatus: "STORED",
+        pendingTxHash: null,
         duplicateKeys: entries.slice(1).map((e) => e.key),
         lastError: null,
       });
@@ -267,6 +325,14 @@ export class CampaignArkivService {
     this.state.updateCreature(key, id, { swarmReference: up.reference, swarmStatus: "UPLOADED", rarity: creature.rarityName, lastError: null });
     return up.reference;
   }
+}
+
+/** "auto" when entities are held by the settler, "approval" when held by the business, else null. */
+export function inferSettlementMode(valid, business, settler) {
+  const owners = [...valid.values()].flat().map((e) => e.owner);
+  if (settler && owners.some((o) => sameAddress(o, settler))) return "auto";
+  if (owners.some((o) => sameAddress(o, business))) return "approval";
+  return null;
 }
 
 /** Arkiv payload for one creature: plain JSON (the shared module maps it to typed Arkiv values). */

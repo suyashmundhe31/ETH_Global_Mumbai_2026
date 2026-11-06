@@ -37,8 +37,10 @@ export async function loadConfig() {
     arkivNetwork: remote.arkivNetwork || "rabdi",
     arkivSchema: remote.arkivSchema || undefined,
     arkivRpcUrl: remote.arkivRpcUrl || null,
-    // Optional. Arkiv access keys are not secrets (they ship with any app, per the SDK docs) but
-    // restrict yours to your origins at hub.arkiv.network. Empty = public, rate-limited endpoint.
-    arkivAccessKey: env.VITE_ARKIV_ACCESS_KEY || "",
+    // Auto settle: the worker's settler wallet (public address), or null when the worker has none.
+    settlerAddress: remote.settlerAddress || null,
+    // No Arkiv access key here (arkiv-app-integration recipe: operator keys never go in browser
+    // bundles). The business's wallet uses its own RPC; it can put its own key in MetaMask's
+    // Arkiv network RPC URL.
   };
 }

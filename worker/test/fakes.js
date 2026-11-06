@@ -34,6 +34,13 @@ export class FakeChain {
   async getRewards() {
     return this.rewards;
   }
+  async getCreature(creatureId) {
+    const id = BigInt(creatureId);
+    const all = await this.getAllCreatures(id >> 32n, this.rarities.length);
+    const c = all[Number(id & 0xffffffffn)];
+    if (!c) throw new Error(`CreatureNotFound(${id})`);
+    return c;
+  }
   async getAllCreatures(campaignId, total) {
     return this.rarities.slice(0, total).map((r, i) => ({
       creatureId: (BigInt(campaignId) << 32n) | BigInt(i),
@@ -95,6 +102,24 @@ export class MemoryArkiv {
     this.failCreatureIds = new Set(); // reject any batch containing these (nothing written)
     this.landThenThrow = 0; // upcoming batches that are written but whose receipt is "lost"
     this.hiddenFromQuery = new Set(); // simulate query index lag
+    this.txs = new Map(); // hash -> { from, to, status: "success" | "reverted" | "pending" }
+    this.nextTx = 1;
+  }
+
+  /** Puts a transaction in the "mempool" (or mined with the given status). */
+  addTx({ from, to = "0x4400000000000000000000000000000000000044", status = "pending" }) {
+    const hash = "0x" + (0xe000 + this.nextTx++).toString(16).padStart(64, "0");
+    this.txs.set(hash, { from, to, status });
+    return hash;
+  }
+
+  async getTransaction(hash) {
+    const t = this.txs.get(hash);
+    return t ? { hash, from: t.from, to: t.to } : null;
+  }
+
+  async transactionStatus(hash) {
+    return this.txs.get(hash)?.status ?? "unknown";
   }
 
   /** Same contract as ArkivCreatureStore.findCampaignEntities ($creator + campaign identity). */
@@ -110,6 +135,18 @@ export class MemoryArkiv {
     return found;
   }
 
+  async findCreatureEntities({ creator, chainId, contract, creatureId }) {
+    return [...this.entities]
+      .filter(([key, e]) => !this.hiddenFromQuery.has(key) && e.creator.toLowerCase() === creator.toLowerCase() && e.values.creatureId === String(creatureId) && BigInt(e.values.chainId) === BigInt(chainId) && e.values.contract.toLowerCase() === contract.toLowerCase())
+      .map(([key, e]) => ({ key, creator: e.creator, owner: e.owner, values: { ...e.values } }));
+  }
+
+  async findHeldBy({ owner, catched }) {
+    return [...this.entities]
+      .filter(([, e]) => e.owner.toLowerCase() === owner.toLowerCase() && (catched === undefined || e.values.catched === catched))
+      .map(([key, e]) => ({ key, creator: e.creator, creatureId: e.values.creatureId, campaignId: e.values.campaignId }));
+  }
+
   async getCreatureEntity(key) {
     return this.entities.has(key) ? this._summary(key) : null;
   }
@@ -119,25 +156,124 @@ export class MemoryArkiv {
     return { key, creator: e.creator, owner: e.owner, creatureId: e.values.creatureId, rarity: e.values.rarity, discountCode: e.values.discountCode, swarmReference: e.values.swarmReference };
   }
 
-  /** A wallet client for `address` (what MetaMask + the SDK wallet client are to the browser). */
+  /** Keys the next `count` creates will get (the fake mints keys sequentially, like a per-signer nonce). */
+  async predictEntityKeys({ count }) {
+    return Array.from({ length: count }, (_, i) => ({ key: "0x" + (this.nextKey + i).toString(16).padStart(64, "0"), salt: 0n }));
+  }
+
+  /** No transaction in flight for the fake signer (it applies every batch synchronously). */
+  async nonceIdle() {
+    return this.inFlight === 0 || this.inFlight === undefined;
+  }
+
+  /**
+   * A wallet client for `address` (what MetaMask + the SDK wallet client are to the browser).
+   * executeBatch follows Arkiv's rules: atomic, creates -> patches -> ownership changes, and only the
+   * CURRENT OWNER may patch or transfer an entity (NotOwner otherwise; nothing applied).
+   */
   walletFor(address) {
     return {
       account: { address },
-      executeBatch: async ({ creates }) => {
+      executeBatch: async ({ creates = [], patches = [], ownershipChanges = [] }) => {
         this.batchCalls++;
         const values = creates.map((c) => Object.fromEntries(Object.entries(c.values).map(([k, v]) => [k, plain(v)])));
         if (values.some((v) => this.failCreatureIds.has(v.creatureId))) throw new Error("arkiv rpc error");
+        if (this.failNextBatch) {
+          this.failNextBatch = false;
+          throw new Error("arkiv rpc error");
+        }
+        // Apply on a copy so a failing operation leaves nothing behind (atomic batch).
+        const next = new Map([...this.entities].map(([k, e]) => [k, { ...e, values: { ...e.values } }]));
+        let nextKey = this.nextKey;
         const keys = values.map((v, i) => {
-          const key = "0x" + (this.nextKey++).toString(16).padStart(64, "0");
-          this.entities.set(key, { creator: address, owner: address, values: v, flags: creates[i].flags, expiration: creates[i].expiration });
+          const key = "0x" + (nextKey++).toString(16).padStart(64, "0");
+          next.set(key, { creator: address, owner: address, values: v, flags: creates[i].flags, expiration: creates[i].expiration });
           return key;
         });
+        const owned = (entityKey) => {
+          const e = next.get(entityKey);
+          if (!e) throw new Error(`EntityNotFound(${entityKey})`);
+          if (e.owner.toLowerCase() !== address.toLowerCase()) throw new Error(`NotOwner(${entityKey}, ${address}, ${e.owner})`);
+          return e;
+        };
+        for (const p of patches) {
+          const e = owned(p.entityKey);
+          Object.assign(e.values, Object.fromEntries(Object.entries(p.set || {}).map(([k, v]) => [k, plain(v)])));
+          for (const k of p.unset || []) delete e.values[k];
+        }
+        for (const o of ownershipChanges) owned(o.entityKey).owner = o.newOwner;
+        this.entities = next;
+        this.nextKey = nextKey;
+        const txHash = this.addTx({ from: address, status: "success" });
         if (this.landThenThrow > 0) {
           this.landThenThrow--;
-          throw new Error("timeout waiting for receipt");
+          throw Object.assign(new Error("timeout waiting for receipt"), { txHash });
         }
-        return { txHash: "0x" + "f".repeat(64), createdEntities: keys };
+        return { txHash, createdEntities: keys };
       },
     };
+  }
+}
+
+const ZERO = "0x0000000000000000000000000000000000000000";
+
+/** Fake CreatureMarket: holdings, listings, events by block (same interface as MarketChain). */
+export class FakeMarket {
+  constructor() {
+    this.address = "0x00000000000000000000000000000000000ca7c4";
+    this.head = 100n;
+    this.events = []; // { blockNumber, eventName, args, transactionHash }
+    this.holdings = new Map(); // creatureId(string) -> { owner, claimedAt, redeemed }
+    this.listings = new Map(); // creatureId(string) -> { seller, price }
+    this.claimed = new Map(); // campaignId(string) -> count
+  }
+  async getBlockNumber() {
+    return this.head;
+  }
+  async getEvents(from, to) {
+    return this.events.filter((e) => e.blockNumber >= from && e.blockNumber <= to);
+  }
+  async getHolding(id) {
+    return this.holdings.get(String(id)) ?? { owner: ZERO, claimedAt: 0n, redeemed: false };
+  }
+  async getListing(id) {
+    return this.listings.get(String(id)) ?? { seller: ZERO, price: 0n };
+  }
+  async claimedCount(campaignId) {
+    return this.claimed.get(String(campaignId)) ?? 0;
+  }
+  _emit(eventName, args) {
+    this.head += 1n;
+    this.events.push({ blockNumber: this.head, eventName, transactionHash: "0x" + this.head.toString(16).padStart(64, "0"), args });
+  }
+  /** The campaign's next creature is claimed by `player`. */
+  claim({ campaignId = 1n, player, rarity = 0 }) {
+    const index = this.claimed.get(String(campaignId)) ?? 0;
+    const creatureId = (BigInt(campaignId) << 32n) | BigInt(index);
+    this.claimed.set(String(campaignId), index + 1);
+    this.holdings.set(String(creatureId), { owner: player, claimedAt: 1n, redeemed: false });
+    this._emit("CreatureClaimed", { creatureId, campaignId: BigInt(campaignId), player, business: BUSINESS, rarity });
+    return creatureId;
+  }
+  redeem(creatureId) {
+    const h = this.holdings.get(String(creatureId));
+    this.holdings.set(String(creatureId), { ...h, redeemed: true });
+    this._emit("Redeemed", { creatureId: BigInt(creatureId), owner: h.owner });
+  }
+  list(creatureId, price) {
+    const seller = this.holdings.get(String(creatureId)).owner;
+    this.listings.set(String(creatureId), { seller, price: BigInt(price) });
+    this._emit("Listed", { creatureId: BigInt(creatureId), seller, price: BigInt(price) });
+  }
+  unlist(creatureId) {
+    const { seller } = this.listings.get(String(creatureId));
+    this.listings.delete(String(creatureId));
+    this._emit("Unlisted", { creatureId: BigInt(creatureId), seller });
+  }
+  buy(creatureId, buyer) {
+    const { seller, price } = this.listings.get(String(creatureId));
+    this.listings.delete(String(creatureId));
+    this.holdings.set(String(creatureId), { ...this.holdings.get(String(creatureId)), owner: buyer });
+    this._emit("Sold", { creatureId: BigInt(creatureId), seller, buyer, price });
   }
 }

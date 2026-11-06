@@ -24,6 +24,8 @@ export function codeAad({ chainId, contract, business, rarity }) {
  * The exact text the wallet signs (EIP-191 personal_sign) to ask the worker to decrypt codes.
  * The worker rebuilds it from the request fields, so a signature only ever authorizes this request.
  * creatureId = null -> all four rarity codes of the campaign (business only).
+ * @param {{ chainId: number | bigint | string, contract: string, campaignId: number | bigint | string,
+ *   creatureId?: number | bigint | string | null, address: string, issuedAt: string }} p
  */
 export function revealMessage({ chainId, contract, campaignId, creatureId = null, address, issuedAt }) {
   return [

@@ -3,8 +3,8 @@
 //
 // Who may decrypt (proved with a wallet signature over revealMessage(), checked with viem):
 //   * the campaign's business wallet (read from the contract): all codes of its campaign
-//   * the current Arkiv $owner of a creature entity created by that business: that creature's code
-//     (today that is the business too; after a capture transfer it is the player)
+//   * the creature's owner on CreatureMarket, and only once it is redeemed there (redeem is final and
+//     blocks selling, so a code is never revealed for a creature that can still change hands)
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { isAddress, isHex, verifyMessage } from "viem";
 import {
@@ -69,11 +69,11 @@ export class CodeCipher {
 export class DiscountCodeService {
   /**
    * @param deps.chain CampaignChain (chainId, address, getCampaign, getRewards, read)
-   * @param deps.arkiv reader with findCampaignEntities({creator, chainId, contract, campaignId})
+   * @param deps.market MarketChain (getHolding: owner + redeemed)
    * @param deps.cipher CodeCipher
    */
-  constructor({ chain, arkiv, cipher, now = () => Date.now() }) {
-    Object.assign(this, { chain, arkiv, cipher, now });
+  constructor({ chain, market, cipher, now = () => Date.now() }) {
+    Object.assign(this, { chain, market, cipher, now });
   }
 
   ctx(business, rarity) {
@@ -121,11 +121,11 @@ export class DiscountCodeService {
     const record = await this.chain.read("getCreature", [creature]);
     const rarity = Number(record.rarity);
     if (!isBusiness) {
-      const entities = await this.arkiv.findCampaignEntities({ creator: campaign.business, chainId: this.chain.chainId, contract: this.chain.address, campaignId: id });
-      const owner = entities.get(creature.toString())?.[0]?.owner;
-      if (!owner || owner.toLowerCase() !== address.toLowerCase()) {
-        throw new CodeAccessError(403, "Only the business or the creature's current Arkiv owner can reveal its code");
+      const holding = await this.market.getHolding(creature);
+      if (holding.owner.toLowerCase() !== address.toLowerCase()) {
+        throw new CodeAccessError(403, "Only the business or the creature's owner can reveal its code");
       }
+      if (!holding.redeemed) throw new CodeAccessError(403, "Redeem the creature first: its code is revealed only after redemption");
     }
     return { campaignId: id.toString(), creatureId: creature.toString(), ...decryptFor(rarity) };
   }

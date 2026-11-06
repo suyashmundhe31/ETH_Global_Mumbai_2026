@@ -62,6 +62,19 @@
           </p>
         </fieldset>
 
+        <fieldset>
+          <legend>F. Settlement of catches</legend>
+          <label class="choice"><input type="radio" name="settlement" value="approval" checked /> <b>Approval</b> —
+            when a player claims a creature, you approve the transfer on this page (signed in MetaMask)</label>
+          <label class="choice"><input type="radio" name="settlement" value="auto" id="settlementAuto" /> <b>Auto settle</b> —
+            each creature is handed to the settler wallet <code id="settlerAddress">…</code> when you sign it on Arkiv;
+            a valid claim on CreatureMarket (within 50 m, one per player) transfers it to the player automatically, and you are notified</label>
+          <p class="hint" id="settlementHint">
+            Either way the creatures are created by your wallet ($creator). Auto settle: $owner is the settler until a
+            valid claim, then the player. An invalid claim is rejected on chain and transfers nothing.
+          </p>
+        </fieldset>
+
         <ul id="formErrors" class="errors"></ul>
         <button id="launchBtn" type="submit" class="primary">Launch Campaign</button>
       </form>
@@ -73,6 +86,7 @@
 
         <h2>Status</h2>
         <ol id="steps" class="steps"></ol>
+        <div id="notice" class="notice" role="status" hidden></div>
         <div id="summary"></div>
       </section>
     </main>
@@ -84,7 +98,7 @@
         <button id="revealCodesBtn" type="button">Reveal discount codes (sign with business wallet)</button>
       </div>
       <p class="hint">Discount codes are stored encrypted on-chain and on Arkiv. Only the worker holds the key; it
-        decrypts for the campaign's business wallet (or a creature's Arkiv owner) after a signed request.</p>
+        decrypts for the campaign's business wallet, or for a creature's owner once they redeem it, after a signed request.</p>
       <table>
         <thead>
           <tr><th>#</th><th>Creature ID</th><th>Rarity</th><th>Discount code</th><th>Arkiv entity</th><th>$owner</th><th>Swarm reference</th></tr>

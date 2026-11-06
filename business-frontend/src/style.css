@@ -74,3 +74,7 @@ table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
 .r-EPIC { color: var(--epic); font-weight: 600; }
 .r-LEGENDARY { color: var(--legendary); font-weight: 600; }
 .actions { margin-bottom: 8px; }
+
+/* Settlement */
+label.choice { display: block; margin: 6px 0; font-weight: normal; }
+.notice { margin: 10px 0; padding: 10px 12px; border-radius: 8px; background: color-mix(in srgb, var(--ok) 15%, transparent); border: 1px solid var(--ok); }

@@ -4,9 +4,9 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 const LINKS = [
-  { href: "/", label: "🗺 Map" },
   { href: "/profile", label: "👤 Profile" },
   { href: "/marketplace", label: "🛒 Marketplace" },
+  { href: "/", label: "🗺 Map" },
 ];
 
 export default function NavBar() {

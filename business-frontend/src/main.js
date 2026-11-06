@@ -5,7 +5,8 @@ import markerIcon from "leaflet/dist/images/marker-icon.png";
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
 import markerShadow from "leaflet/dist/images/marker-shadow.png";
 import { api } from "./api.js";
-import { arkivChainFor, ensureArkivNetwork, isUserRejection, metaMaskArkivWallet, writeCreatureBatches } from "./arkivWrite.js";
+import { custom } from "viem";
+import { approveCatches, arkivChainFor, ensureArkivNetwork, entityKeyPredictor, isUserRejection, metaMaskArkivWallet, rabdiBatchTxParams, writeCreatureBatches } from "./arkivWrite.js";
 import { loadConfig } from "./config.js";
 import "./style.css";
 import { revealMessage } from "../../shared/discountCodes.js";
@@ -29,7 +30,7 @@ const STEP_DEFS = [
   ["swarm", "Upload .glb to Swarm"],
   ["tx", "Submit createCampaign transaction"],
   ["vrf", "Chainlink VRF fulfilment + on-chain Fisher–Yates allocation"],
-  ["arkiv", "Business signs one Arkiv entity per creature ($creator = $owner = business wallet)"],
+  ["arkiv", "Business signs one Arkiv entity per creature ($creator = business; $owner = business, or the settler with Auto settle)"],
 ];
 function resetSteps() {
   $("steps").innerHTML = STEP_DEFS.map(([k, t]) => `<li id="step-${k}" class="pending"><b>${t}</b><span></span></li>`).join("");
@@ -74,6 +75,11 @@ function readForm() {
     expiration: $("expiration").value ? new Date($("expiration").value).toISOString() : "",
     asset: $("asset").value,
   };
+}
+
+/** "auto" only when chosen AND the worker runs a settler; otherwise the current approval flow. */
+function settlementChoice() {
+  return $("settlementAuto").checked && cfg.settlerAddress ? "auto" : "approval";
 }
 
 // ---------------------------------------------------------------- map
@@ -271,13 +277,14 @@ async function createArkivEntities(campaignId) {
   step("arkiv", "active", "preparing per-creature Swarm models…");
   const plan = await waitForPlan(campaignId);
   renderCampaign(await api.campaign(campaignId));
-  if (plan.payloads.length === 0) return verifyArkiv(campaignId);
+  if (plan.payloads.length === 0) return verifyArkiv(campaignId, plan.pending);
 
   if (!conn) await doConnect();
   if (conn.address.toLowerCase() !== plan.business.toLowerCase()) {
     throw new Error(`Switch MetaMask to the business wallet of this campaign (${plan.business}); it must sign the creatures.`);
   }
-  const chain = arkivChainFor({ network: cfg.arkivNetwork, accessKey: cfg.arkivAccessKey, rpcUrl: cfg.arkivRpcUrl });
+  // The wallet uses its own RPC for Arkiv: no operator access key is shipped in this page.
+  const chain = arkivChainFor({ network: cfg.arkivNetwork, rpcUrl: cfg.arkivRpcUrl });
   step("arkiv", "active", `switch MetaMask to Arkiv ${esc(chain.name)}…`);
   await ensureArkivNetwork(window.ethereum, chain);
   const balance = BigInt(await window.ethereum.request({ method: "eth_getBalance", params: [conn.address, "latest"] }));
@@ -285,26 +292,50 @@ async function createArkivEntities(campaignId) {
     throw new Error(`The business wallet has no ${chain.nativeCurrency.symbol} on Arkiv ${chain.name}. Get some at https://hub.arkiv.network/faucet, then retry.`);
   }
 
+  // Settlement mode: a campaign that already has creatures on Arkiv keeps the mode they were written with
+  // (the worker infers it from their $owner); otherwise the business's choice in section F.
+  const mode = plan.settlement?.mode ?? settlementChoice();
+  const settler = plan.settlement?.settler;
+  if (mode === "auto" && !settler) throw new Error("Auto settle needs the worker's settler (SETTLER_PRIVATE_KEY); choose Approval or configure it.");
+
   const batches = Math.ceil(plan.payloads.length / plan.batchSize);
   let signed = 0;
-  step("arkiv", "active", `${plan.stored}/${plan.total} on Arkiv · confirm ${batches} transaction(s) in MetaMask…`);
+  step("arkiv", "active", `${plan.stored}/${plan.total} on Arkiv · ${mode === "auto" ? `auto settle via <code>${short(settler, 6)}</code> · ` : ""}confirm ${batches} transaction(s) in MetaMask…`);
   const wallet = metaMaskArkivWallet(window.ethereum, conn.address, chain);
+  const request = (args) => window.ethereum.request(args);
   const result = await writeCreatureBatches({
     walletClient: wallet,
     plan,
     schemaName: cfg.arkivSchema,
+    // Auto settle: the same atomic batch hands each new creature to the settler ($creator stays the business).
+    settleTo: mode === "auto" ? settler : undefined,
+    predictKeys: mode === "auto" ? entityKeyPredictor(custom(window.ethereum), chain, conn.address) : undefined,
+    // arkiv-app-integration: re-check the account and chain before every signature.
+    beforeBatch: async () => {
+      const [account] = await request({ method: "eth_accounts" });
+      if (!account || account.toLowerCase() !== plan.business.toLowerCase()) throw new Error("MetaMask account changed; switch back to the business wallet and retry.");
+      if (Number(await request({ method: "eth_chainId" })) !== chain.id) throw new Error(`MetaMask left Arkiv ${chain.name}; switch back and retry.`);
+    },
+    // arkiv-write-safety: explicit gas from an unsigned estimate, bounded by the block gas limit.
+    txParamsFor: (batch) => rabdiBatchTxParams({ request, account: conn.address, chain, batch }),
     onBatch: async (r) => {
       signed++;
       if (r.ok) await api.arkivSubmissions(campaignId, { txHash: r.txHash, entries: r.entries }).catch(() => {});
-      step("arkiv", "active", `batch ${signed}/${batches} ${r.ok ? "written" : "failed"} · ${r.ok ? "" : esc(r.error.shortMessage || r.error.message)}`);
+      else if (r.sent && r.txHash) await api.arkivSubmissions(campaignId, { txHash: r.txHash, pending: r.creatureIds }).catch(() => {});
+      const why = r.ok ? "" : esc(isUserRejection(r.error) ? "rejected in MetaMask" : r.error.shortMessage || r.error.message);
+      step("arkiv", "active", `batch ${signed}/${batches} ${r.ok ? "written" : "stopped"} · ${why}`);
     },
   });
   if (result.rejected) step("arkiv", "active", "signature rejected in MetaMask · verifying what was written…");
-  return verifyArkiv(campaignId);
+  else if (result.uncertain) step("arkiv", "active", "a transaction's outcome is uncertain · verifying (it is held back from retries until Arkiv shows it)…");
+  const after = await api.arkivPlan(campaignId).catch(() => ({ pending: [] }));
+  const report = await verifyArkiv(campaignId, after.pending);
+  watchSettlements(campaignId);
+  return report;
 }
 
 /** Verification is done by the worker against Arkiv itself ($creator must be the business). */
-async function verifyArkiv(campaignId) {
+async function verifyArkiv(campaignId, pending = []) {
   step("arkiv", "active", "verifying on Arkiv…");
   let report;
   for (let i = 0; i < 5; i++) {
@@ -314,7 +345,12 @@ async function verifyArkiv(campaignId) {
   }
   renderCampaign(await api.campaign(campaignId));
   if (report.status === "COMPLETE") {
-    step("arkiv", "done", `${report.stored}/${report.expected} entities · $creator = $owner = <code>${short(report.creator, 6)}</code>`);
+    step("arkiv", "done", `${report.stored}/${report.expected} entities · $creator = <code>${short(report.creator, 6)}</code>`);
+  } else if (pending?.length) {
+    // Never offer to re-sign creatures whose earlier transaction may still land (duplicates).
+    const held = pending.reduce((n, p) => n + p.creatureIds.length, 0);
+    step("arkiv", "error", `${report.stored}/${report.expected} on Arkiv · ${held} waiting for an earlier transaction (${pending.map((p) => `<code>${short(p.txHash, 8)}</code> ${esc(p.status)}`).join(", ")}) · reload to re-check`);
+    $("arkivSignBtn").hidden = report.missing.length <= held;
   } else {
     step("arkiv", "error", `${report.stored}/${report.expected} on Arkiv · ${report.missing.length} missing`);
     $("arkivSignBtn").hidden = false;
@@ -329,9 +365,10 @@ async function showExistingCampaign(campaignId) {
   await api.arkivVerify(campaignId).catch(() => {});
   const view = await api.campaign(campaignId);
   renderCampaign(view);
+  watchSettlements(campaignId);
   const a = view.arkiv;
   if (view.onChain.status !== "ALLOCATED") return step("arkiv", "pending", "waiting for VRF allocation");
-  if (a.status === "COMPLETE") return step("arkiv", "done", `${a.stored}/${view.onChain.totalCreatures} entities · $creator = $owner = <code>${short(a.creator, 6)}</code>`);
+  if (a.status === "COMPLETE") return step("arkiv", "done", `${a.stored}/${view.onChain.totalCreatures} entities · $creator = <code>${short(a.creator, 6)}</code>`);
   step("arkiv", "error", `${a.stored}/${view.onChain.totalCreatures} on Arkiv · the business wallet must sign the rest`);
   $("arkivSignBtn").hidden = false;
 }
@@ -363,6 +400,138 @@ async function revealCodes() {
   if (lastView) renderCampaign(lastView);
 }
 
+// ---------------------------------------------------------------- settlement (Approval / Auto settle)
+function settlementSummary(s) {
+  if (!s || !s.mode) return "not decided yet (chosen when you sign the creatures on Arkiv)";
+  const claimed = `${s.claimed ?? 0} claimed by players`;
+  if (s.mode === "approval") return `<b>Approval</b> · you approve each claim below (signed in MetaMask) · ${claimed}`;
+  return `<b>Auto settle</b> · settler <code>${short(s.settler, 6)}</code> holds uncaught creatures and transfers each valid claim · ${claimed}`;
+}
+
+function feedTable(rows, head) {
+  return `<table><thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function formatWei(wei) {
+  if (wei === null || wei === undefined) return "—";
+  const v = BigInt(wei);
+  const whole = v / 10n ** 18n;
+  const frac = (v % 10n ** 18n).toString().padStart(18, "0").replace(/0+$/, "");
+  return `${whole}${frac ? `.${frac}` : ""} ETH`;
+}
+
+function settlementPanel(s) {
+  if (!s?.mode) return "";
+  let html = "";
+  if (s.mode === "approval") {
+    const rows = (s.approvals || [])
+      .map(
+        (a) => `<tr><td><code>${esc(a.creatureId)}</code></td><td class="r-${esc(a.rarity)}">${esc(a.rarity)}</td>
+          <td><code title="${esc(a.player)}">${short(a.player, 6)}</code></td><td>${a.redeemed ? "yes" : "no"}</td></tr>`,
+      )
+      .join("");
+    html += `<h3>Claims awaiting your approval</h3>${
+      rows
+        ? `${feedTable(rows, ["Creature", "Rarity", "Player (new $owner)", "Redeemed"])}
+           <button type="button" id="approveBtn" class="primary">Approve ${s.approvals.length} claim(s) on Arkiv</button>
+           <p class="hint" id="approveStatus">Each approval sets catched = true and transfers the creature to its player, in atomic batches you confirm in MetaMask.</p>`
+        : `<p class="hint">No claims waiting. When a player claims a creature within 50 m, it appears here for approval.</p>`
+    }`;
+  } else {
+    const rows = (s.autoSettled || [])
+      .map(
+        (e) => `<tr><td>${new Date(e.settledAt).toLocaleString()}</td><td><code>${esc(e.creatureId)}</code></td>
+          <td class="r-${esc(e.rarity)}">${esc(e.rarity)}</td><td><code title="${esc(e.player)}">${short(e.player, 6)}</code></td>
+          <td><code title="${esc(e.arkivTxHash)}">${short(e.arkivTxHash, 8)}</code></td></tr>`,
+      )
+      .join("");
+    const waiting = (s.pending || []).length ? `<p class="hint">${s.pending.length} creature(s) being synced to Arkiv…</p>` : "";
+    html += `<h3>Auto-settled claims</h3>${waiting}${
+      rows
+        ? feedTable(rows, ["When", "Creature", "Rarity", "Player (new $owner)", "Arkiv tx"])
+        : `<p class="hint">No claims yet. When a player claims a creature, it moves to them automatically and appears here.</p>`
+    }`;
+  }
+  const sales = (s.sales || [])
+    .map(
+      (e) => `<tr><td>${new Date(e.at).toLocaleString()}</td><td><code>${esc(e.creatureId)}</code></td><td class="r-${esc(e.rarity)}">${esc(e.rarity ?? "")}</td>
+        <td><code title="${esc(e.buyer)}">${short(e.buyer, 6)}</code></td><td>${esc(formatWei(e.price))}</td></tr>`,
+    )
+    .join("");
+  if (sales) html += `<h3>Marketplace resales</h3>${feedTable(sales, ["When", "Creature", "Rarity", "Buyer (new $owner)", "Price"])}`;
+  return html;
+}
+
+// Notify the business of claims and transfers since the page last looked (polling while open).
+const seenEvents = new Set();
+let eventsPrimed = false;
+function notifyNewSettlements(v) {
+  const s = v.settlement || {};
+  const events = [
+    ...(s.autoSettled || []).map((e) => [`auto:${e.creatureId}`, `🎉 A player claimed <b>${esc(e.rarity)}</b> creature <code>${esc(e.creatureId)}</code>; ownership transferred to <code>${short(e.player, 6)}</code>.`]),
+    ...(s.approvals || []).map((a) => [`claim:${a.creatureId}`, `🔔 <code>${short(a.player, 6)}</code> claimed <b>${esc(a.rarity)}</b> creature <code>${esc(a.creatureId)}</code>: approve it below.`]),
+    ...(s.sales || []).map((e) => [`sale:${e.creatureId}:${e.at}`, `💱 Creature <code>${esc(e.creatureId)}</code> was resold to <code>${short(e.buyer, 6)}</code> for ${esc(formatWei(e.price))}.`]),
+  ];
+  const fresh = events.filter(([k]) => !seenEvents.has(k));
+  fresh.forEach(([k]) => seenEvents.add(k));
+  if (eventsPrimed && fresh.length) {
+    $("notice").hidden = false;
+    $("notice").innerHTML = fresh.map(([, html]) => html).join("<br />");
+  }
+  eventsPrimed = true;
+}
+
+let settlementPoll = null;
+function watchSettlements(campaignId) {
+  clearInterval(settlementPoll);
+  settlementPoll = setInterval(async () => {
+    if (busy || String(currentCampaignId) !== String(campaignId)) return;
+    const v = await api.campaign(campaignId).catch(() => null);
+    if (v) renderCampaign(v);
+  }, 15000);
+}
+
+/** Approval campaigns: the business signs catched = true + ownership -> player for every pending claim. */
+async function approvePending() {
+  if (currentCampaignId === null || busy) return;
+  busy = true;
+  const status = (html) => {
+    const el = $("approveStatus");
+    if (el) el.innerHTML = html;
+  };
+  try {
+    const v = await api.campaign(currentCampaignId); // fresh list: never approve from a stale view
+    const approvals = v.settlement?.approvals || [];
+    if (!approvals.length) return renderCampaign(v);
+    if (!conn) await doConnect();
+    if (conn.address.toLowerCase() !== v.onChain.business.toLowerCase()) throw new Error(`Switch MetaMask to the campaign's business wallet (${v.onChain.business}).`);
+    const chain = arkivChainFor({ network: cfg.arkivNetwork, rpcUrl: cfg.arkivRpcUrl });
+    status("switch MetaMask to Arkiv and confirm the transaction(s)…");
+    await ensureArkivNetwork(window.ethereum, chain);
+    const request = (args) => window.ethereum.request(args);
+    const res = await approveCatches({
+      walletClient: metaMaskArkivWallet(window.ethereum, conn.address, chain),
+      approvals,
+      schemaName: cfg.arkivSchema,
+      batchSize: cfg.arkivBatchSize,
+      beforeBatch: async () => {
+        const [account] = await request({ method: "eth_accounts" });
+        if (!account || account.toLowerCase() !== v.onChain.business.toLowerCase()) throw new Error("MetaMask account changed; switch back to the business wallet.");
+        if (Number(await request({ method: "eth_chainId" })) !== chain.id) throw new Error(`MetaMask left Arkiv ${chain.name}; switch back.`);
+      },
+      txParamsFor: (batch) => rabdiBatchTxParams({ request, account: conn.address, chain, batch }),
+      onBatch: (r) => status(r.ok ? `approved ${r.creatureIds.length} · tx <code>${short(r.txHash, 8)}</code>` : esc(r.rejected ? "rejected in MetaMask" : r.error.shortMessage || r.error.message)),
+    });
+    await sleep(2000); // the query index can trail the latest block slightly
+    renderCampaign(await api.campaign(currentCampaignId));
+    if (res.failed.length) status(`${res.approved} approved · ${res.failed.length} not approved${res.uncertain ? " (a transaction may still land; reload in a moment)" : ""} · click Approve again to finish`);
+  } catch (err) {
+    status(esc(isUserRejection(err) ? "rejected in MetaMask" : err.shortMessage || err.message));
+  } finally {
+    busy = false;
+  }
+}
+
 function renderCampaign(v) {
   lastView = v;
   const oc = v.onChain;
@@ -376,10 +545,12 @@ function renderCampaign(v) {
       <dt>Rarity distribution</dt><dd>${counts}</dd>
       <dt>Creation tx</dt><dd>${txLink(v.txs.creationTxHash)}</dd>
       <dt>VRF</dt><dd>${esc(oc.status)} · request ${esc(oc.vrfRequestId)} · fulfilment tx ${txLink(v.txs.allocationTxHash)}</dd>
-      <dt>Arkiv</dt><dd>${esc(v.arkiv.status)} · ${v.arkiv.stored}/${oc.totalCreatures} · $creator = $owner = <code>${short(v.arkiv.creator, 6)}</code> · schema <code>${esc(v.arkiv.schema)}</code> · expiry: ${esc(v.arkiv.expirationMode || "—")}</dd>
+      <dt>Arkiv</dt><dd>${esc(v.arkiv.status)} · ${v.arkiv.stored}/${oc.totalCreatures} · $creator = <code>${short(v.arkiv.creator, 6)}</code> · schema <code>${esc(v.arkiv.schema)}</code> · expiry: ${esc(v.arkiv.expirationMode || "—")}</dd>
+      <dt>Settlement</dt><dd>${settlementSummary(v.settlement)}</dd>
       <dt>Campaign Swarm ref</dt><dd><a href="#" data-swarm="${esc(oc.swarmReference)}"><code>${short(oc.swarmReference, 8)}</code></a></dd>
       <dt>Expires</dt><dd>${exp}</dd>
-    </dl>`;
+    </dl>${settlementPanel(v.settlement)}`;
+  notifyNewSettlements(v);
   if (v.creatures.length) {
     $("results").hidden = false;
     $("creatureRows").innerHTML = v.creatures
@@ -404,6 +575,8 @@ async function boot() {
   resetSteps();
   cfg = await loadConfig();
   $("netInfo").innerHTML = `${esc(cfg.chainName)} · contract <code>${short(cfg.campaignManager || "not set", 6)}</code> · VRF: ${esc(cfg.vrfMode)}`;
+  $("settlerAddress").textContent = cfg.settlerAddress || "(worker not reachable)";
+  if (!cfg.settlerAddress) $("settlementAuto").disabled = true;
   initMap();
   await loadAssets();
   $("asset").addEventListener("change", showLocalModel);
@@ -425,6 +598,7 @@ async function boot() {
     }
   });
   document.addEventListener("click", (e) => {
+    if (e.target.closest("#approveBtn")) return void approvePending();
     const a = e.target.closest("[data-swarm]");
     if (!a) return;
     e.preventDefault();

@@ -1,9 +1,0 @@
-{
-  "chainSelectorName": "ethereum-testnet-sepolia-base-1",
-  "chainId": 84532,
-  "catchManager": "0x49729C3EF7F899112E6B485206776225c6FB7Da6",
-  "campaignManager": "0xF0Cbd7c4F16C62f12196FF2Bd6ff7cc733d18F83",
-  "catchReceiver": "0x72B825eBE1F597b288D94D9523Df937545889022",
-  "catchRadiusMeters": 100,
-  "gasLimit": "1000000"
-}

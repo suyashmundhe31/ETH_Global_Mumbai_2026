@@ -37,6 +37,11 @@ export class CampaignChain {
     return { ...c, statusName: CAMPAIGN_STATUS[c.status] };
   }
 
+  async getCreature(creatureId) {
+    const c = await this.read("getCreature", [BigInt(creatureId)]);
+    return { ...c, rarityName: RARITY[c.rarity] };
+  }
+
   getRewards(campaignId) {
     return this.read("getRewards", [BigInt(campaignId)]);
   }

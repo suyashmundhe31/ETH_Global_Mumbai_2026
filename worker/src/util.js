@@ -34,8 +34,21 @@ export function chunk(arr, size) {
 /** JSON.stringify that turns bigint into decimal strings. */
 export const toJson = (value) => JSON.stringify(value, (_k, v) => (typeof v === "bigint" ? v.toString() : v));
 
+// RPC URLs can carry access keys in their path (Arkiv: rabdi({ accessKey }); providers like Alchemy),
+// so every URL is removed from messages that reach logs or API responses (arkiv-security-trust recipe).
+export const redactUrls = (text) => String(text).replace(/\b(?:https?|wss?):\/\/[^\s"'<>)]+/gi, "<url redacted>");
+
 // viem errors keep the RPC's actual reason (e.g. "eth_getLogs is limited to a 200 range") in `details`.
 export const errMessage = (err) => {
   const msg = err?.shortMessage || err?.message || String(err);
-  return err?.details && !msg.includes(err.details) ? `${msg} (${err.details})` : msg;
+  return redactUrls(err?.details && !msg.includes(err.details) ? `${msg} (${err.details})` : msg);
+};
+
+/** host[:port] of a URL, for logs (never the path, which may hold a key). */
+export const urlHost = (url) => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return "<invalid url>";
+  }
 };

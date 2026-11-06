@@ -4,8 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { createPlayer } from "@/lib/player";
-import Campaigns from "@/components/Campaigns";
-import Collection from "@/components/Collection";
+import Spawns from "@/components/Spawns";
 import { ROAD_OFFSETS, buildStreetlights } from "@/lib/streetlights";
 import { drawFacade, facadeLighting, facadePixelRatio, lightPresetFor, type FacadeType, type LightPreset } from "@/lib/facades";
 
@@ -30,7 +29,7 @@ const BUTTON: React.CSSProperties = {
   touchAction: "manipulation",
 };
 
-export default function GameMap({ wallet }: { wallet: string }) {
+export default function GameMap({ wallet }: { wallet: `0x${string}` }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<LightMode>("auto");
   const modeRef = useRef<LightMode>("auto");
@@ -344,8 +343,7 @@ export default function GameMap({ wallet }: { wallet: string }) {
   return (
     <>
       <div ref={containerRef} style={{ position: "fixed", inset: 0 }} />
-      {world && <Campaigns map={world.map} getPlayerPos={world.getPlayerPos} wallet={wallet} />}
-      <Collection wallet={wallet} />
+      {world && <Spawns map={world.map} getPlayerPos={world.getPlayerPos} wallet={wallet} />}
       <button
         type="button"
         aria-label="Switch time of day"

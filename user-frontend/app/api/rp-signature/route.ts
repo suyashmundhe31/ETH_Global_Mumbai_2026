@@ -4,8 +4,9 @@ import { isAddress } from "viem";
 import { tag } from "@/lib/session";
 
 export async function POST(req: Request) {
-  const { address } = await req.json();
-  if (!isAddress(address)) return NextResponse.json({ error: "Bad address" }, { status: 400 });
+  const { address } = await req.json().catch(() => ({}));
+  if (!isAddress(address ?? "")) return NextResponse.json({ error: "Bad address" }, { status: 400 });
+  if (!process.env.RP_SIGNING_KEY) return NextResponse.json({ error: "RP_SIGNING_KEY is not set" }, { status: 500 });
 
   const { sig, nonce, createdAt, expiresAt } = signRequest({
     signingKeyHex: process.env.RP_SIGNING_KEY!,
