@@ -4,7 +4,7 @@
 //   syncSold       (seller)    ownership -> buyer, after an on-chain sale
 //   markRedeemed   (owner)     redeemed = true
 
-import { createPublicClient, createWalletClient } from "@arkiv-network/sdk";
+import { ExpirationTime, createPublicClient, createWalletClient } from "@arkiv-network/sdk";
 import { rabdi } from "@arkiv-network/sdk/chains";
 import { and, asc, between, eq, gt, or } from "@arkiv-network/sdk/query";
 import { bool, defineSchema, i32, key, str, u64 } from "@arkiv-network/sdk/schema";
@@ -46,7 +46,9 @@ export type Creature = {
   modelUrl: string; // GLB on Swarm
 };
 
-const SWARM_GATEWAY = process.env.NEXT_PUBLIC_SWARM_GATEWAY || "https://api.gateway.ethswarm.org";
+// Read gateway: api.gateway.ethswarm.org answers /bzz reads with HTTP 500 (the browser then reports it as a
+// CORS failure); download.gateway.ethswarm.org serves the same references with CORS open.
+const SWARM_GATEWAY = process.env.NEXT_PUBLIC_SWARM_GATEWAY || "https://download.gateway.ethswarm.org";
 /** The manifest's index document is the GLB (served as model/gltf-binary, CORS open). */
 export const swarmUrl = (reference: string) => `${SWARM_GATEWAY}/bzz/${reference}/`;
 
@@ -162,7 +164,25 @@ const CHUNK = 20;
 async function arkivWallet(account: Address) {
   await walletFor(rabdiChain, account); // switch (or add) MetaMask to Rabdi
   const eth = (window as unknown as { ethereum: EIP1193Provider }).ethereum;
-  return createWalletClient({ chain: rabdiChain, transport: custom(eth), account });
+  // MetaMask grants accounts per network: ask again on Rabdi, else sends fail with 4100 "not authorized".
+  const [granted] = await eth.request({ method: "eth_requestAccounts" });
+  if (!granted || !isAddressEqual(granted, account)) throw new Error(`Connect ${account} to this site in MetaMask (Rabdi network)`);
+  return createWalletClient({ chain: rabdiChain, transport: custom(eth), account: granted });
+}
+
+/** MetaMask 4100 = this site may not use the account on Rabdi. Open its permission screen (pick the account
+ *  and allow Rabdi), then try once more. */
+async function authorized<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    let x = e as { code?: number; cause?: unknown } | undefined;
+    while (x && typeof x === "object" && x.code !== 4100) x = x.cause as typeof x;
+    if (!x || typeof x !== "object") throw e;
+    const eth = (window as unknown as { ethereum: EIP1193Provider }).ethereum;
+    await eth.request({ method: "wallet_requestPermissions", params: [{ eth_accounts: {} }] });
+    return fn();
+  }
 }
 
 type Move = { key: Hex; to: Address; markCatched: boolean };
@@ -174,10 +194,10 @@ async function runMoves(account: Address, moves: Move[], onProgress: (done: numb
   onProgress(0, moves.length);
   for (let i = 0; i < moves.length; i += CHUNK) {
     const chunk = moves.slice(i, i + CHUNK);
-    await wallet.executeBatch({
+    await authorized(() => wallet.executeBatch({
       patches: chunk.filter((m) => m.markCatched).map((m) => ({ schema: CreatureSchema, entityKey: m.key, set: { catched: true } })),
       ownershipChanges: chunk.map((m) => ({ entityKey: m.key, newOwner: m.to })),
-    });
+    }));
     onProgress(Math.min(i + CHUNK, moves.length), moves.length);
   }
   return moves.length;
@@ -207,11 +227,58 @@ export async function syncSold(seller: Address, onProgress: (done: number, total
   return runMoves(seller, moves, onProgress);
 }
 
+// A player's listing: their own entity (the business may still hold the creature entity on Arkiv).
+// Trusted only while its creator still owns the creature on chain (checked by the marketplace).
+const ListingSchema = defineSchema("ethglobal-mumbai-2026.listing.v1", { creatureId: str().indexed() });
+
+/** Owner: put a creature on the marketplace. */
+export async function listCreature(owner: Address, creatureId: bigint) {
+  const wallet = await arkivWallet(owner);
+  await authorized(() => wallet.createEntity(ListingSchema, { creatureId: creatureId.toString() }, { expiration: ExpirationTime.fromDays(30) }));
+}
+
+/** creatureId -> seller: listing entities (creator) plus creature entities with listed = true (owner). */
+export async function listedSellers(): Promise<Map<string, Address>> {
+  const out = new Map<string, Address>();
+  const listings = await client.select({ $creator: true, creatureId: true }).from(ListingSchema).limit(PAGE).fetch();
+  for (const l of listings.entities) out.set(l.creatureId.value, l.$creator);
+  const flagged = await client
+    .select({ $owner: true, creatureId: true })
+    .from(CreatureSchema)
+    .where(eq("listed", bool(true)))
+    .createdBy(CREATURE_OWNER)
+    .limit(PAGE)
+    .fetch();
+  for (const f of flagged.entities) out.set(f.creatureId.value, f.$owner);
+  return out;
+}
+
+export type CreatureRow = { key: Hex; owner: Address; businessName: string; rarity: string; description: string; listed: boolean; redeemed: boolean };
+
+/** Arkiv entity of each creature id (whoever holds it now), keyed by id; ids with no entity are missing. */
+export async function creatureRows(ids: bigint[]): Promise<Map<string, CreatureRow>> {
+  const rows = await Promise.all(
+    ids.map(async (id) => {
+      const [r] = (
+        await client
+          .select({ $key: true, $owner: true, businessName: true, rarity: true, discountDescription: true, listed: true, redeemed: true })
+          .from(CreatureSchema)
+          .where(eq("creatureId", str(id.toString())))
+          .createdBy(CREATURE_OWNER)
+          .limit(1)
+          .fetch()
+      ).entities;
+      return r ? ([id.toString(), { key: r.$key, owner: r.$owner, businessName: r.businessName.value, rarity: r.rarity.value, description: r.discountDescription.value, listed: r.listed.value, redeemed: r.redeemed.value }] as const) : null;
+    }),
+  );
+  return new Map(rows.filter((r) => r !== null));
+}
+
 /** Owner: mirror the on-chain redemption on their Arkiv entity (no-op if they don't hold it yet). */
 export async function markRedeemed(owner: Address, creatureId: bigint) {
   const e = (await entitiesOwnedBy(owner)).find((x) => x.creatureId === creatureId);
   if (!e || e.redeemed) return false;
   const wallet = await arkivWallet(owner);
-  await wallet.patchEntity(CreatureSchema, e.key, { set: { redeemed: true } });
+  await authorized(() => wallet.patchEntity(CreatureSchema, e.key, { set: { redeemed: true } }));
   return true;
 }

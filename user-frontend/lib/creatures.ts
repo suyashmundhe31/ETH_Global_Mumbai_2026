@@ -1,16 +1,17 @@
 import { createPublicClient } from "@arkiv-network/sdk"
 import { rabdi } from "@arkiv-network/sdk/chains"
-import { addr, defineSchema, i32, str, u64 } from "@arkiv-network/sdk/schema"
-import { http } from "viem"
+import { and, asc, eq, gt, or } from "@arkiv-network/sdk/query"
+import { addr, bool, defineSchema, i32, key, str, u64 } from "@arkiv-network/sdk/schema"
+import { http, type Hex } from "viem"
 
-// Same columns as the entities already on Arkiv (9 of them are indexed).
-export const Creature = defineSchema("ethglobal-mumbai-2026.creature.v1", {
+// Same columns as the entities on Arkiv (11 of them are indexed).
+export const Creature = defineSchema("ethglobal-mumbai-2026.creature.v2", {
   allocationTxHash: str(),
-  business: addr().indexed(),
   businessName: str(),
   campaignId: u64().indexed(),
   campaignSwarmReference: str(),
   campaignTxHash: str(),
+  catched: bool().indexed(),
   chainId: u64().indexed(),
   contract: addr().indexed(),
   createdAt: u64(),
@@ -20,40 +21,58 @@ export const Creature = defineSchema("ethglobal-mumbai-2026.creature.v1", {
   discountDescription: str(),
   expiresAtUnix: u64().indexed(),
   latitudeE6: i32().indexed(),
+  listed: bool().indexed(),
   longitudeE6: i32().indexed(),
   rarity: str().indexed(),
+  redeemed: bool().indexed(),
   swarmReference: str(),
   totalCreatures: u64(),
   vrfRequestId: str(),
 })
 
-// Anyone can write entities with this schema name, so only trust ones made by our issuer.
-const ISSUER = (process.env.CREATURE_ISSUER ?? "0x448c0810c8bcacb84f9343a6adbd1b0ab71da220") as `0x${string}`
+// Anyone can write entities with this schema name, so only trust ones created by the business wallet.
+const CREATOR = (process.env.CREATURE_CREATOR ?? "0x0913B468eeba5099cF6AEb61242423294D604fBa") as Hex
 
 const client = createPublicClient({
   chain: rabdi({ accessKey: process.env.ARKIV_ACCESS_KEY ?? "" }),
   transport: http(),
 })
 
-// Creatures currently owned by `owner`.
-export async function getCreatures(owner: string) {
-  const { entities } = await client
-    .select({
-      $key: true, allocationTxHash: true, business: true, businessName: true, campaignId: true,
-      campaignSwarmReference: true, campaignTxHash: true, chainId: true, contract: true,
-      createdAt: true, creatureId: true, creatureIndex: true, discountCode: true,
-      discountDescription: true, expiresAtUnix: true, latitudeE6: true, longitudeE6: true,
-      rarity: true, swarmReference: true, totalCreatures: true, vrfRequestId: true,
-    })
-    .from(Creature)
-    .ownedBy(owner as `0x${string}`)
-    .createdBy(ISSUER)
-    .fetch()
+const PAGE = 100
 
-  // Plain strings, so the result can be sent as JSON (u64 values are bigint).
-  return entities.map((e) =>
-    Object.fromEntries(
-      Object.entries(e).map(([k, v]) => [k, typeof v === "object" && v && "value" in v ? String(v.value) : String(v)]),
-    ),
-  )
+// Every matching entity (paged by $key), as plain strings so it can be sent as JSON (u64 values are bigint).
+// market: listed & unredeemed; otherwise not listed, or redeemed (redeemed ones stay in the profile).
+async function fetchAll(market: boolean, owner?: Hex) {
+  const filter = market
+    ? and(eq("listed", bool(true)), eq("redeemed", bool(false)))
+    : or(eq("listed", bool(false)), eq("redeemed", bool(true)))
+  const out: Record<string, string>[] = []
+  let after: Hex = `0x${"0".repeat(64)}`
+  for (;;) {
+    const q = client
+      .select({
+        $key: true, $owner: true, businessName: true, campaignId: true, catched: true, creatureId: true,
+        discountCode: true, discountDescription: true, expiresAtUnix: true, listed: true, rarity: true,
+        redeemed: true, swarmReference: true,
+      })
+      .from(Creature)
+      .where(and(filter, gt("$key", key(after))))
+      .createdBy(CREATOR)
+      .orderBy(asc("$key"))
+      .limit(PAGE)
+    const { entities } = await (owner ? q.ownedBy(owner) : q).fetch()
+    for (const e of entities) {
+      out.push(
+        Object.fromEntries(
+          Object.entries(e).map(([k, v]) => [k, typeof v === "object" && v && "value" in v ? String(v.value) : String(v)]),
+        ),
+      )
+    }
+    if (entities.length < PAGE) return out
+    after = entities[entities.length - 1].$key
+  }
 }
+
+// Profile: creatures `owner` holds that aren't on the market. Redeemed ones always stay here.
+export const getCreatures = (owner: string) =>
+  fetchAll(false, owner as Hex)

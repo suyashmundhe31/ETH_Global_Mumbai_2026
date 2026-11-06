@@ -11,6 +11,7 @@ import {
   createWalletClient,
   custom,
   decodeEventLog,
+  fallback,
   hexToBytes,
   http,
   isAddressEqual,
@@ -40,6 +41,9 @@ export const catchAbi = parseAbi([
   "event CatchRequested(uint256 indexed attemptId, uint256 indexed campaignId, address indexed player, int32 playerLatE6, int32 playerLonE6, int32 spawnLatE6, int32 spawnLonE6, bytes worldIdProof)",
   "function requestCatch(uint256 campaignId, int32 latE6, int32 lonE6, bytes worldIdProof) returns (uint256)",
   "function getAttempt(uint256 attemptId) view returns ((address player, uint8 status, uint64 createdAt, uint32 totalCreatures, uint256 campaignId, uint256 vrfRequestId, uint256 creatureId))",
+  "function activeAttempt(address player, uint256 campaignId) view returns (uint256)",
+  "function expireAttempt(uint256 attemptId)",
+  "function ATTEMPT_TIMEOUT() view returns (uint64)",
   "function getCaught(uint256 creatureId) view returns ((address owner, uint64 floatE18, uint64 caughtAt, uint8 rarity, uint256 attemptId))",
   "function getPlayerCatches(address player) view returns (uint256[])",
   "function canSpawnFor(address player, uint256 campaignId) view returns (bool)",
@@ -53,7 +57,20 @@ const campaignAbi = parseAbi([
   "function getCampaign(uint256 campaignId) view returns ((address business, uint8 status, int32 latitudeE6, int32 longitudeE6, uint64 expiresAt, uint64 createdAt, uint64 requestedAt, uint64 allocatedAt, uint32 totalCreatures, uint32[4] rarityCounts, uint256 vrfRequestId, uint256 randomWord, string businessName, string swarmReference))",
 ]);
 
-export const chain = createPublicClient({ chain: baseSepolia, transport: http(process.env.NEXT_PUBLIC_BASE_SEPOLIA_RPC || undefined) });
+// Public Base Sepolia RPCs rate-limit hard (HTTP 429), so without a configured RPC we fall through several
+// keyless ones: a 429 on one moves the request to the next instead of failing the catch.
+const PUBLIC_BASE_SEPOLIA_RPCS = [
+  "https://base-sepolia-rpc.publicnode.com",
+  "https://base-sepolia.drpc.org",
+  "https://base-sepolia.gateway.tenderly.co",
+  "https://sepolia.base.org",
+];
+export const chain = createPublicClient({
+  chain: baseSepolia,
+  transport: process.env.NEXT_PUBLIC_BASE_SEPOLIA_RPC
+    ? http(process.env.NEXT_PUBLIC_BASE_SEPOLIA_RPC)
+    : fallback(PUBLIC_BASE_SEPOLIA_RPCS.map((url) => http(url, { retryCount: 1 }))),
+});
 
 // --- MetaMask ---------------------------------------------------------------------------------------------
 
@@ -98,10 +115,15 @@ export async function spawnableCampaigns(player: Address, campaignIds: string[])
   return new Set(campaignIds.filter((_, i) => results[i].status === "success" && results[i].result === true));
 }
 
-export type CatchPhase = "confirm" | "verifying" | "rolling" | "caught" | "missed" | "rejected" | "expired";
+export type CatchPhase = "clearing" | "confirm" | "verifying" | "rolling" | "caught" | "missed" | "rejected" | "expired";
 export type Caught = { creatureId: bigint; rarity: number; float: number };
 
-/** requestCatch, then follow the attempt: CRE verdict (VERIFYING -> ROLLING/REJECTED), then VRF (CAUGHT/FAILED). */
+/**
+ * requestCatch, then follow the attempt: CRE verdict (VERIFYING -> ROLLING/REJECTED), then VRF (CAUGHT/FAILED).
+ * The contract allows one open attempt per player and campaign, so an open one is handled first instead of
+ * sending a requestCatch that reverts with AttemptInProgress: past ATTEMPT_TIMEOUT it is expired (one extra
+ * MetaMask confirmation), otherwise we keep following it.
+ */
 export async function catchCreature(
   player: Address,
   campaignId: string,
@@ -109,6 +131,24 @@ export async function catchCreature(
   lng: number,
   onPhase: (p: CatchPhase) => void,
 ): Promise<Caught | null> {
+  const open = await chain.readContract({ address: CATCH_MANAGER, abi: catchAbi, functionName: "activeAttempt", args: [player, BigInt(campaignId)] });
+  if (open !== BigInt(0)) {
+    const [a, timeout, block] = await Promise.all([
+      chain.readContract({ address: CATCH_MANAGER, abi: catchAbi, functionName: "getAttempt", args: [open] }),
+      chain.readContract({ address: CATCH_MANAGER, abi: catchAbi, functionName: "ATTEMPT_TIMEOUT" }),
+      chain.getBlock(),
+    ]);
+    if (block.timestamp < a.createdAt + timeout) {
+      onPhase(a.status === 2 ? "rolling" : "verifying");
+      return followAttempt(open, onPhase);
+    }
+    onPhase("clearing");
+    const wallet = await walletFor(baseSepolia, player);
+    const expireHash = await wallet.writeContract({ address: CATCH_MANAGER, abi: catchAbi, functionName: "expireAttempt", args: [open] });
+    const expired = await chain.waitForTransactionReceipt({ hash: expireHash });
+    if (expired.status !== "success") throw new Error("expireAttempt reverted");
+  }
+
   onPhase("confirm");
   const wallet = await walletFor(baseSepolia, player);
   const hash = await wallet.writeContract({
@@ -123,10 +163,13 @@ export async function catchCreature(
   if (!log) throw new Error("CatchRequested not found in the receipt");
   const { args } = decodeEventLog({ abi: catchAbi, eventName: "CatchRequested", topics: log.topics, data: log.data });
   onPhase("verifying");
+  return followAttempt(args.attemptId, onPhase);
+}
 
-  // AttemptStatus: 1 VERIFYING, 2 ROLLING, 3 CAUGHT, 4 FAILED, 5 REJECTED, 6 EXPIRED
+/** Poll an attempt until it resolves. AttemptStatus: 1 VERIFYING, 2 ROLLING, 3 CAUGHT, 4 FAILED, 5 REJECTED, 6 EXPIRED */
+async function followAttempt(attemptId: bigint, onPhase: (p: CatchPhase) => void): Promise<Caught | null> {
   for (let i = 0; i < 400; i++) {
-    const a = await chain.readContract({ address: CATCH_MANAGER, abi: catchAbi, functionName: "getAttempt", args: [args.attemptId] });
+    const a = await chain.readContract({ address: CATCH_MANAGER, abi: catchAbi, functionName: "getAttempt", args: [attemptId] });
     if (a.status === 2) onPhase("rolling");
     if (a.status === 3) {
       const c = await chain.readContract({ address: CATCH_MANAGER, abi: catchAbi, functionName: "getCaught", args: [a.creatureId] });

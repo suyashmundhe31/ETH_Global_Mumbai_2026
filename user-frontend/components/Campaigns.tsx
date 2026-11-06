@@ -13,6 +13,7 @@ import ModelViewer from "@/components/ModelViewer";
 
 const REFETCH_MOVE = 300; // m — refetch when the player is this far from the last fetch centre
 const REFETCH_EVERY = 60_000; // ms
+const RETRY_AFTER = 15_000; // ms — back-off after a failed load (rate limits)
 const FETCH_RADIUS = VISIBLE_RADIUS + REFETCH_MOVE; // covers the 1 km circle until the next refetch
 
 const RARITY_COLOR: Record<string, string> = {
@@ -53,6 +54,7 @@ const ACTION: React.CSSProperties = {
 };
 
 const PHASE_LABEL: Record<CatchPhase, string> = {
+  clearing: "Expiring your timed-out attempt: confirm in MetaMask…",
   confirm: "Confirm in MetaMask…",
   verifying: "Verifying distance (Chainlink CRE)…",
   rolling: "Verified ✓ Rolling (Chainlink VRF)…",
@@ -81,7 +83,7 @@ export default function Campaigns({
   const [phase, setPhase] = useState<CatchPhase | null>(null);
   const [catchError, setCatchError] = useState("");
   const [result, setResult] = useState<(Caught & { businessName: string; description: string; modelUrl: string }) | null>(null);
-  const busy = phase === "confirm" || phase === "verifying" || phase === "rolling";
+  const busy = phase === "clearing" || phase === "confirm" || phase === "verifying" || phase === "rolling";
 
   // Follow the player (GPS or dev-mode walking) without re-rendering on every frame.
   useEffect(() => {
@@ -94,7 +96,13 @@ export default function Campaigns({
 
   // Load creatures around the player; refetch after moving far or every minute.
   const fetchedAt = useRef<mapboxgl.LngLat | null>(null);
+  // One load at a time, and after a failure wait RETRY_AFTER: the position ticks every 500 ms, and retrying
+  // on each tick floods the public RPCs, which answer with 429s (that also break an in-flight catch).
+  const loading = useRef(false);
+  const retryAt = useRef(0);
   const load = useCallback(async (at: mapboxgl.LngLat) => {
+    if (loading.current || Date.now() < retryAt.current) return;
+    loading.current = true;
     fetchedAt.current = at;
     try {
       if (!chainConfigured) throw new Error("NEXT_PUBLIC_CATCH_MANAGER is not set");
@@ -105,7 +113,10 @@ export default function Campaigns({
     } catch (err) {
       console.error("Arkiv fetch failed", err);
       setLoadError("Couldn't load creatures. Retrying…");
-      fetchedAt.current = null; // retry on the next tick
+      fetchedAt.current = null; // retry on the first tick after the back-off
+      retryAt.current = Date.now() + RETRY_AFTER;
+    } finally {
+      loading.current = false;
     }
   }, [wallet]);
 
@@ -136,7 +147,11 @@ export default function Campaigns({
     return () => {
       m.destroy();
       models.current = null;
-      if (map.getLayer(m.layer.id)) map.removeLayer(m.layer.id);
+      // GameMap may already have called map.remove() (its cleanup runs first on unmount), after which
+      // getLayer() throws; the layer went with the map, so there's nothing left to remove.
+      try {
+        if (map.getLayer(m.layer.id)) map.removeLayer(m.layer.id);
+      } catch {}
     };
   }, [map]);
   useEffect(() => {

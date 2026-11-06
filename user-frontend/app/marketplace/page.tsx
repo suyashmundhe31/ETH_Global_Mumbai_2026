@@ -2,14 +2,16 @@ import { Suspense } from "react";
 import { redirect } from "next/navigation";
 import { currentPlayer } from "@/lib/currentPlayer";
 import NavBar from "@/components/NavBar";
+import Market from "@/components/Market";
 
 async function Marketplace() {
-  if (!(await currentPlayer())) redirect("/");
+  const player = await currentPlayer();
+  if (!player) redirect("/");
   return (
     <main style={PAGE}>
       <NavBar />
       <h1>Marketplace</h1>
-      <p style={{ color: "#9aa3b2" }}>Coming soon: trade creatures and items with other players.</p>
+      <Market wallet={player.wallet} />
     </main>
   );
 }
