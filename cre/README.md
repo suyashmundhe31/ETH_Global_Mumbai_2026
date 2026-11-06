@@ -57,7 +57,7 @@ console.log("WORKFLOW_BOX_SK_ALL=" + h(k.secretKey)); console.log("NEXT_PUBLIC_W
 Deploy (`forge script`): `PRIVATE_KEY` (passed as `--private-key`), optional `CAMPAIGN_MANAGER`
 (default `0xF0Cbd7c4F16C62f12196FF2Bd6ff7cc733d18F83`) and `CRE_FORWARDER` (default: the MockKeystoneForwarder).
 
-`frontend/.env`:
+`user-frontend/.env`:
 
 | Var | |
 |---|---|
