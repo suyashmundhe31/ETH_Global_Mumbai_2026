@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
 import { createPlayer, type GpsStatus, type Player } from "@/lib/player";
-import { createOcclusion, occludedPaint } from "@/lib/occlusion";
+import { createOcclusion, occludedPaint, type Occlusion } from "@/lib/occlusion";
 import Campaigns from "@/components/Campaigns";
 import { ROAD_OFFSETS, buildStreetlights } from "@/lib/streetlights";
 import { drawFacade, facadeLighting, facadePixelRatio, lightPresetFor, type FacadeType, type LightPreset } from "@/lib/facades";
@@ -36,7 +36,7 @@ export default function GameMap({ wallet }: { wallet: string }) {
   const [bearing, setBearing] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [arOpen, setArOpen] = useState(false);
-  const [world, setWorld] = useState<{ map: mapboxgl.Map; player: Player } | null>(null);
+  const [world, setWorld] = useState<{ map: mapboxgl.Map; player: Player; occlusion: Occlusion } | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -322,7 +322,7 @@ export default function GameMap({ wallet }: { wallet: string }) {
       player = createPlayer(map, { devMode: devModeRef.current, onStatus: setGps });
       map.addLayer(player.layer);
       occlusion = createOcclusion(map, player.getPosition);
-      setWorld({ map, player });
+      setWorld({ map, player, occlusion });
     });
 
     return () => {
@@ -364,7 +364,7 @@ export default function GameMap({ wallet }: { wallet: string }) {
     <>
       <div ref={containerRef} className="map-stage" />
       {world && (
-        <Campaigns map={world.map} player={world.player} wallet={wallet} devMode={devMode} arOpen={arOpen} setArOpen={setArOpen} />
+        <Campaigns map={world.map} player={world.player} occlusion={world.occlusion} wallet={wallet} devMode={devMode} arOpen={arOpen} setArOpen={setArOpen} />
       )}
 
       <div className="hud hud-status" aria-live="polite">

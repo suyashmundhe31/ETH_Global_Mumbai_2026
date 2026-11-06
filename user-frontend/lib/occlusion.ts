@@ -1,6 +1,8 @@
-// Buildings near the player flatten to their footprint, so the avatar never clips into (or hides behind)
-// a 3D wall. Only the buildings within HIDE_WITHIN metres go flat; they rise again past SHOW_BEYOND
-// (hysteresis, so standing on the boundary doesn't make a building flicker).
+// Buildings flatten to their footprint where something must stay visible:
+//   - around the player: within HIDE_WITHIN metres (rising again past SHOW_BEYOND, so standing on the
+//     boundary doesn't make a building flicker), so the avatar never clips into a wall;
+//   - at creature spawns: any building containing a spawn point or within SPAWN_CLEAR metres of it, so a
+//     creature placed inside a venue stands visibly at its exact Arkiv location instead of inside the walls.
 //
 // Fast path: feature-state `near` on the Mapbox Streets building features (a paint-only change, no tile
 // re-layout). Fallback when the tiles carry no feature ids: a `distance` filter on the extrusion layers plus
@@ -10,6 +12,7 @@ import mapboxgl from "mapbox-gl";
 
 export const HIDE_WITHIN = 18; // m — building goes flat
 export const SHOW_BEYOND = 26; // m — building stands up again
+export const SPAWN_CLEAR = 12; // m — around each creature spawn
 const CHECK_EVERY = 200; // ms
 const MOVE_EPS = 0.75; // m — re-check after moving this far (or when new tiles arrive)
 
@@ -67,6 +70,7 @@ function distanceToPolygon(p: mapboxgl.LngLat, geom: GeoJSON.Geometry): number {
 
 export function createOcclusion(map: mapboxgl.Map, getPos: () => mapboxgl.LngLat) {
   let hidden = new Map<string | number, true>();
+  let anchors: mapboxgl.LngLat[] = []; // creature spawn points
   let mode: "state" | "filter" | null = null;
   let lastPos: mapboxgl.LngLat | null = null;
   let dirty = true;
@@ -86,7 +90,7 @@ export function createOcclusion(map: mapboxgl.Map, getPos: () => mapboxgl.LngLat
 
   // Fallback: no feature ids, so hide by distance filter and draw flat footprints instead.
   const applyDistanceFilters = (p: mapboxgl.LngLat) => {
-    const pt: GeoJSON.Point = { type: "Point", coordinates: [p.lng, p.lat] };
+    const pt: GeoJSON.MultiPoint = { type: "MultiPoint", coordinates: [p, ...anchors].map((q) => [q.lng, q.lat]) };
     const far: mapboxgl.FilterSpecification = [">=", ["distance", pt], HIDE_WITHIN];
     for (const id of LAYERS) {
       if (!map.getLayer(id)) continue;
@@ -141,13 +145,14 @@ export function createOcclusion(map: mapboxgl.Map, getPos: () => mapboxgl.LngLat
         continue;
       }
       if (next.has(f.id)) continue;
-      // Cheap reject: the first vertex is far beyond anything we care about.
       const g = f.geometry;
       const first = g.type === "Polygon" ? g.coordinates[0]?.[0] : g.type === "MultiPolygon" ? g.coordinates[0]?.[0]?.[0] : null;
       if (!first) continue;
-      if (Math.abs(first[1] - p.lat) * M_PER_DEG > 400) continue;
+      // Cheap reject: a building more than ~300 m from a point can't be within any clearing radius.
+      const near = (q: mapboxgl.LngLat) => Math.abs(first[1] - q.lat) * M_PER_DEG < 300 && Math.abs(first[0] - q.lng) * M_PER_DEG < 330;
       const limit = hidden.has(f.id) ? SHOW_BEYOND : HIDE_WITHIN;
-      if (distanceToPolygon(p, g) < limit) next.set(f.id, true);
+      if (near(p) && distanceToPolygon(p, g) < limit) next.set(f.id, true);
+      else if (anchors.some((a) => near(a) && distanceToPolygon(a, g) < SPAWN_CLEAR)) next.set(f.id, true);
     }
     if (features.length) mode = "state";
     for (const id of hidden.keys()) if (!next.has(id)) setNear(id, false);
@@ -158,6 +163,14 @@ export function createOcclusion(map: mapboxgl.Map, getPos: () => mapboxgl.LngLat
   const timer = setInterval(check, CHECK_EVERY);
 
   return {
+    /** Creature spawn points: buildings at and around them go flat. */
+    setAnchors(points: mapboxgl.LngLat[]) {
+      const same = points.length === anchors.length && points.every((q, i) => q.lng === anchors[i].lng && q.lat === anchors[i].lat);
+      if (same) return;
+      anchors = points;
+      dirty = true;
+      filterPos = null;
+    },
     /** Re-check now (e.g. after a teleport). */
     refresh() {
       dirty = true;
@@ -169,3 +182,5 @@ export function createOcclusion(map: mapboxgl.Map, getPos: () => mapboxgl.LngLat
     },
   };
 }
+
+export type Occlusion = ReturnType<typeof createOcclusion>;

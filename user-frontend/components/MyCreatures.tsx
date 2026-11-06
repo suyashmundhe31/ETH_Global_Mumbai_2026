@@ -4,16 +4,26 @@
 // bought ones) with its Arkiv data.
 //   Ready (unredeemed, unlisted) -> Redeem reward (CRE reveals the code sealed to this wallet's key) or List on market
 //   Redeemed                     -> Show code again (sign only, no tx)
-//   Listed                       -> waiting on the marketplace
+//   Listed                       -> View on market, or Unlist (back to Redeem / List)
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { isAddressEqual, type Address } from "viem";
+import * as arkiv from "@/lib/arkiv";
 import { creatureRows, entitiesOwnedBy, listCreature, listedSellers, markRedeemed } from "@/lib/arkiv";
 import { RARITIES, chainConfigured, ownedCreatures, redeem, type RedeemPhase } from "@/lib/chain";
 import Avatar, { shortAddr } from "@/components/Avatar";
 import CreatureCard, { RARITY_ORDER, titleCase } from "@/components/CreatureCard";
-import { IconAlert, IconCheck, IconCopy, IconGift, IconMap, IconPaw, IconShield, IconTag } from "@/components/icons";
+import { IconAlert, IconCheck, IconClose, IconCopy, IconGift, IconMap, IconPaw, IconShield, IconTag } from "@/components/icons";
+
+// The Arkiv side of unlisting lives in lib/arkiv.ts (`unlistCreature(owner, creatureId)`, same shape as
+// listCreature). Looked up at runtime so the page still builds and runs before that code is merged.
+type Unlist = (owner: Address, creatureId: bigint) => Promise<unknown>;
+const unlistCreature: Unlist = (owner, creatureId) => {
+  const fn = (arkiv as unknown as { unlistCreature?: Unlist }).unlistCreature;
+  if (!fn) return Promise.reject(new Error("Unlisting isn't available yet: lib/arkiv.ts has no unlistCreature."));
+  return fn(owner, creatureId);
+};
 
 // The SDK wraps wallet/RPC failures in a generic message; walk the cause chain to show the real reason.
 type Err = { code?: number; message?: string; shortMessage?: string; details?: string; cause?: unknown };
@@ -234,10 +244,16 @@ export default function MyCreatures({ wallet }: { wallet: string }) {
                         {here ? busy.label : "Show code"}
                       </button>
                     ) : listed ? (
-                      <Link href="/marketplace" className="btn btn-secondary">
-                        <IconTag />
-                        View on market
-                      </Link>
+                      <>
+                        <Link href="/marketplace" className="btn btn-secondary">
+                          <IconTag />
+                          Market
+                        </Link>
+                        <button type="button" className="btn btn-secondary" disabled={!!busy} onClick={() => void run(id, "unlist", () => unlistCreature(player, c.creatureId))}>
+                          {here && busy.label === "unlist" ? <span className="spinner" /> : <IconClose />}
+                          {here && busy.label === "unlist" ? "Unlisting…" : "Unlist"}
+                        </button>
+                      </>
                     ) : (
                       <>
                         <button type="button" className="btn btn-primary" disabled={!!busy} onClick={() => void reveal(id, c, true)}>

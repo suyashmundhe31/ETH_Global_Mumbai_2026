@@ -23,15 +23,19 @@ export const RUN_SPEED = 3; // m/s — above this the "Running" clip plays
 export const SHIFT_RUN_SPEED = 5; // m/s — arrow keys + Shift in dev mode
 const FADE = 0.3; // s — animation crossfade
 const TURN_RATE = 10; // 1/s — heading smoothing
-const IDLE_GRACE = 0.6; // s — stay in the walk cycle this long after stopping (GPS fixes arrive in steps)
+const IDLE_GRACE = 0.35; // s — stay in the walk cycle this long after stopping (avoids flicker between steps)
 
+// GPS tracking (see gpsStep): steps from the accelerometer move the avatar instantly in the direction the
+// phone points; GPS fixes continuously pull it onto your true position; standing still ignores GPS drift.
 const GPS_JUMP = 150; // m — fixes further than this teleport instead of walking
-const GPS_JITTER = 2.5; // m — ignore movement smaller than this
 const GPS_MAX_ACCURACY = 65; // m — ignore worse fixes once we have a good one
-const GPS_MAX_SPEED = 9; // m/s — cap for the smoothing walk
 const RANGE_RADIUS = 50; // m — the white circle around the player
-const FACE_COMPASS_BELOW = 0.9; // m/s — slower than this (or standing), face where the phone points
 const COMPASS_FRESH = 2000; // ms
+const STRIDE = 0.72; // m per step
+const STEP_WINDOW = 1100; // ms — a step this recent means "walking"
+const STILL_AFTER = 1800; // ms — no step for this long means "standing"
+const MOVING = 0.3; // m/s — avatar speed above this plays the walk cycle and faces the direction of travel
+const M_PER_DEG = 111_320;
 
 /** Avatar heading (model space: atan2(east, south)) for a compass bearing in radians clockwise from north. */
 const fromBearing = (b: number) => Math.atan2(Math.sin(b), -Math.cos(b));
@@ -65,7 +69,13 @@ export function createPlayer(
   let dev = options.devMode;
   let destroyed = false;
   let follow = true;
-  let movingFor = 0; // s since the last step (for IDLE_GRACE)
+  let movingFor = 0; // s since the avatar last moved (for IDLE_GRACE)
+  // GPS tracking state
+  let fixAcc = 50; // m
+  let fixAt = 0; // performance.now() of the last fix
+  let fixVel = { e: 0, n: 0 }; // m/s, from the device's GPS speed + course
+  let vel = { e: 0, n: 0 }; // m/s, smoothed avatar velocity
+  let walkRate = 1; // walk-cycle playback speed (matches your step rate)
   let status: GpsStatus = dev ? { kind: "dev" } : { kind: "locating" };
 
   const setStatus = (s: GpsStatus) => {
@@ -189,6 +199,60 @@ export function createPlayer(
     map.jumpTo({ center: pos });
   };
 
+  // --- GPS tracking (real-time, drift-free) ---
+  /** Moves `pos` one frame toward where you really are. Returns true when the avatar is visibly moving. */
+  const gpsStep = (dt: number) => {
+    if (!fix || dt <= 0) return false;
+    const now = performance.now();
+    const kx = M_PER_DEG * Math.cos((pos.lat * Math.PI) / 180);
+    // The fix, projected forward by the device-reported velocity (GPS positions lag 1–2 s behind you).
+    const lead = Math.min((now - fixAt) / 1000, 2);
+    const errE = (fix.lng - pos.lng) * kx + fixVel.e * lead;
+    const errN = (fix.lat - pos.lat) * M_PER_DEG + fixVel.n * lead;
+    const err = Math.hypot(errE, errN);
+    if (err > GPS_JUMP) {
+      pos = fix;
+      vel = { e: 0, n: 0 };
+      return false;
+    }
+
+    const stepping = motionOk && now - lastStepAt < STEP_WINDOW;
+    const still = motionOk && now - lastStepAt > STILL_AFTER;
+    const compassOk = compass !== null && now - compassAt < COMPASS_FRESH;
+
+    // 1) Dead reckoning: each detected step moves you right away, in the direction the phone points.
+    let de = 0, dn = 0;
+    if (stepping && compassOk) {
+      const sp = Math.min(Math.max(cadence * STRIDE, 0.6), 2.6);
+      de = Math.sin(compass!) * sp * dt;
+      dn = Math.cos(compass!) * sp * dt;
+    }
+
+    // 2) GPS correction, stronger with better accuracy. Standing still: hold position unless GPS is clearly elsewhere.
+    const accK = Math.min(Math.max(10 / Math.max(fixAcc, 4), 0.3), 1.6);
+    let gain: number;
+    if (!motionOk) gain = err < Math.min(fixAcc * 0.25, 2.5) ? 0 : 1.4 * accK; // no motion sensor: smoothed GPS
+    else if (still) gain = err > Math.max(fixAcc, 10) ? 0.8 : 0; // drift inside the accuracy circle is ignored
+    else gain = (stepping ? 1.1 : 0.7) * accK;
+    const k = 1 - Math.exp(-gain * dt);
+    de += errE * k;
+    dn += errN * k;
+
+    if (de || dn) pos = new mapboxgl.LngLat(pos.lng + de / kx, pos.lat + dn / M_PER_DEG);
+
+    // Smoothed velocity drives the facing direction.
+    const f = 1 - Math.exp(-6 * dt);
+    vel = { e: vel.e + (de / dt - vel.e) * f, n: vel.n + (dn / dt - vel.n) * f };
+    const sp = Math.hypot(vel.e, vel.n);
+    if (sp > MOVING) headingTarget = Math.atan2(vel.e, -vel.n); // model space: atan2(east, south)
+    else if (stepping && compassOk) headingTarget = fromBearing(compass!); // tiny steps: face where you walk
+    // Walking animation follows your feet, not the map: every detected step animates, even if the avatar
+    // barely moves on the map. The legs keep pace with your step rate.
+    speed = Math.max(sp, stepping ? cadence * STRIDE : 0);
+    walkRate = stepping ? Math.min(Math.max(cadence / 1.8, 0.75), 1.5) : 1;
+    return stepping || sp > MOVING;
+  };
+
   // --- Movement loop ---
   const clock = new THREE.Clock();
   let raf = 0;
@@ -216,6 +280,8 @@ export function createPlayer(
       headingTarget = Math.atan2(east, -north); // mercator y points south
       moved = true;
       setFollow(true);
+    } else if (!dev) {
+      moved = gpsStep(dt);
     } else if (target) {
       const a = mapboxgl.MercatorCoordinate.fromLngLat(pos);
       const b = mapboxgl.MercatorCoordinate.fromLngLat(target);
@@ -233,14 +299,14 @@ export function createPlayer(
       moved = true;
     }
 
-    // GPS mode: standing or creeping (where GPS drift would spin the avatar around), face where the phone points.
-    if (!dev && compass !== null && performance.now() - compassAt < COMPASS_FRESH && (!target || speed < FACE_COMPASS_BELOW)) {
-      headingTarget = fromBearing(compass);
-    }
+    // GPS mode, not moving: face where the phone points.
+    if (!dev && !moved && compass !== null && performance.now() - compassAt < COMPASS_FRESH) headingTarget = fromBearing(compass);
     heading = lerpAngle(heading, headingTarget, 1 - Math.exp(-TURN_RATE * dt));
     movingFor = moved ? 0 : movingFor + dt;
     const walking = movingFor < IDLE_GRACE;
     play(walking ? (speed > RUN_SPEED ? "Running" : "Walking") : "Idle");
+    const walkClip = actions.get("Walking");
+    if (walkClip) walkClip.timeScale += ((dev ? 1 : walkRate) - walkClip.timeScale) * Math.min(1, dt * 4);
     mixer?.update(dt);
     followCamera();
     map.triggerRepaint();
@@ -321,15 +387,41 @@ export function createPlayer(
   };
   window.addEventListener("deviceorientationabsolute", onAbsolute as EventListener);
   window.addEventListener("deviceorientation", onOrientation as EventListener);
+  // --- Step detector (accelerometer). A few float ops per event: cheap. ---
+  let motionOk = false; // the device sends motion data
+  let lastStepAt = 0;
+  let cadence = 1.8; // steps/s, smoothed
+  let gravity = 9.81;
+  let armed = true;
+  const onMotion = (e: DeviceMotionEvent) => {
+    const a = e.accelerationIncludingGravity;
+    if (!a || a.x == null || a.y == null || a.z == null) return;
+    motionOk = true;
+    const mag = Math.hypot(a.x, a.y, a.z);
+    gravity += (mag - gravity) * 0.02; // slow low-pass = gravity
+    const hp = mag - gravity; // the bounce of each step
+    const now = performance.now();
+    if (armed && hp > 1.3 && now - lastStepAt > 260) {
+      const gap = now - lastStepAt;
+      if (gap < 1500) cadence += (Math.min(Math.max(1000 / gap, 1), 3.5) - cadence) * 0.3;
+      lastStepAt = now;
+      armed = false;
+    } else if (hp < 0) {
+      armed = true;
+    }
+  };
+  window.addEventListener("devicemotion", onMotion);
+
   const askMotion = () => {
-    const DOE = (window as unknown as { DeviceOrientationEvent?: { requestPermission?: () => Promise<string> } }).DeviceOrientationEvent;
-    if (typeof DOE?.requestPermission === "function") DOE.requestPermission().catch(() => null);
+    type Perm = { requestPermission?: () => Promise<string> };
+    const w = window as unknown as { DeviceOrientationEvent?: Perm; DeviceMotionEvent?: Perm };
+    if (typeof w.DeviceOrientationEvent?.requestPermission === "function") w.DeviceOrientationEvent.requestPermission().catch(() => null);
+    if (typeof w.DeviceMotionEvent?.requestPermission === "function") w.DeviceMotionEvent.requestPermission().catch(() => null);
   };
   window.addEventListener("pointerdown", askMotion, { once: true });
 
   // --- Real GPS ---
   let watchId: number | null = null;
-  let lastFix = 0;
   const startGps = () => {
     if (watchId !== null) return;
     if (!navigator.geolocation) {
@@ -344,24 +436,18 @@ export function createPlayer(
         const next = new mapboxgl.LngLat(p.coords.longitude, p.coords.latitude);
         if (fix && acc > GPS_MAX_ACCURACY) return; // keep the last good fix rather than jump around
         const first = !fix;
-        const dtS = lastFix ? (p.timestamp - lastFix) / 1000 : 0;
-        const d = pos.distanceTo(next);
-        lastFix = p.timestamp;
         fix = next;
+        fixAcc = acc;
+        fixAt = performance.now();
+        // Device-reported velocity (lets the tracker lead the lagging fix). Unknown course = no lead.
+        const v = p.coords.speed, c = p.coords.heading;
+        fixVel = v != null && v > 0.3 && c != null && !Number.isNaN(c) ? { e: Math.sin((c * Math.PI) / 180) * v, n: Math.cos((c * Math.PI) / 180) * v } : { e: 0, n: 0 };
         setStatus({ kind: "live", accuracy: Math.round(acc) });
-        if (first || d > GPS_JUMP || dtS <= 0) {
-          pos = next; // first fix or a big jump: teleport, camera snaps along
+        if (first) {
+          pos = next; // first fix: teleport, camera snaps along
           target = null;
-          if (first) map.jumpTo({ center: pos });
+          map.jumpTo({ center: pos });
           setFollow(true);
-        } else if (d > Math.min(Math.max(GPS_JITTER, acc * 0.4), 8)) {
-          // Arrive roughly when the next fix is due, so the walk is continuous between fixes.
-          target = next;
-          const interval = Math.min(Math.max(dtS, 0.8), 3);
-          speed = Math.min(Math.max(p.coords.speed || d / interval, 0.6), GPS_MAX_SPEED);
-          // Really moving and the device reports a course: trust it over the noisy point-to-point direction.
-          const course = p.coords.heading;
-          if (course != null && !Number.isNaN(course) && (p.coords.speed ?? 0) > 1.2) headingTarget = fromBearing((course * Math.PI) / 180);
         }
       },
       (err) => {
@@ -369,13 +455,12 @@ export function createPlayer(
         if (err.code === err.PERMISSION_DENIED) setStatus({ kind: "denied" });
         else if (!fix) setStatus({ kind: "unavailable", message: err.message || "Couldn't get a location fix." });
       },
-      { enableHighAccuracy: true, maximumAge: 1000, timeout: 20_000 },
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 20_000 },
     );
   };
   const stopGps = () => {
     if (watchId !== null) navigator.geolocation.clearWatch(watchId);
     watchId = null;
-    lastFix = 0;
   };
   if (dev) setStatus({ kind: "dev" });
   else startGps();
@@ -399,6 +484,7 @@ export function createPlayer(
         setStatus({ kind: "dev" });
       } else {
         fix = null;
+        vel = { e: 0, n: 0 };
         startGps();
       }
       setFollow(true);
@@ -421,6 +507,7 @@ export function createPlayer(
       window.removeEventListener("deviceorientationabsolute", onAbsolute as EventListener);
       window.removeEventListener("deviceorientation", onOrientation as EventListener);
       window.removeEventListener("pointerdown", askMotion);
+      window.removeEventListener("devicemotion", onMotion);
     },
   };
 }

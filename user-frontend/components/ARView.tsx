@@ -308,9 +308,9 @@ export default function ARView({
       const hit = raycaster.intersectObjects(boxes, false)[0];
       const target = hit && [...live.values()].find((l) => l.hitbox === hit.object);
       if (!target) return;
-      const c = latest.current.campaigns.find((x) => x.campaignId === target.id);
+      const c = latest.current.campaigns.find((x) => x.id === target.id);
       if (!c) return;
-      latest.current.onSelect(c.campaignId);
+      latest.current.onSelect(c.id);
       if (catching || latest.current.busy) return showToast("Hold on, your catch is still being processed…");
       catching = target;
       navigator.vibrate?.(40);
@@ -389,7 +389,7 @@ export default function ARView({
       const o = orient.current;
       const { campaigns: list, selectedId: sel } = latest.current;
       const me = player.getPosition();
-      const selected = list.find((c) => c.campaignId === sel) ?? list[0] ?? null;
+      const selected = list.find((c) => c.id === sel) ?? list[0] ?? null;
 
       // Camera orientation.
       if (o.ok) {
@@ -418,23 +418,23 @@ export default function ARView({
         const d = Math.hypot(e, n) || 0.001;
         const dirX = e / d, dirZ = -n / d;
         const inRange = d <= CATCH_RADIUS;
-        const btn = wpEls.current.get(c.campaignId);
+        const btn = wpEls.current.get(c.id);
         let anchorY = EYE + 0.9;
         let anchorD = Math.min(d, WAYPOINT_DIST);
 
         if (inRange) {
-          keep.add(c.campaignId);
-          let l = live.get(c.campaignId);
-          if (!l || l.dying) l = spawn(c.campaignId, c.modelUrl);
+          keep.add(c.id);
+          let l = live.get(c.id);
+          if (!l || l.dying) l = spawn(c.id, c.modelUrl);
           const show = THREE.MathUtils.clamp(d, NEAR_SHOW, FAR_SHOW);
           l.scale = THREE.MathUtils.clamp(show / 4, 1, 2.4);
           anchorD = show;
           anchorY = CREATURE_HEIGHT * l.scale + 0.45;
           if (l.group && !l.hop) l.group.position.set(dirX * show, 0, dirZ * show);
-          let ring = rings.get(c.campaignId);
+          let ring = rings.get(c.id);
           if (!ring) {
             ring = new THREE.Mesh(ringGeo, ringMat);
-            rings.set(c.campaignId, ring);
+            rings.set(c.id, ring);
             scene.add(ring);
           }
           const at = l.group?.position ?? tmp.set(dirX * show, 0, dirZ * show);
@@ -446,13 +446,13 @@ export default function ARView({
           btn.hidden = false;
           placeWaypoint(btn, tmp.set(dirX * anchorD, anchorY, dirZ * anchorD).clone());
           btn.dataset.inRange = String(inRange);
-          btn.dataset.selected = String(c.campaignId === selected?.campaignId);
+          btn.dataset.selected = String(c.id === selected?.id);
           const label = btn.querySelector(".wp-dist");
           const text = inRange ? "Tap to catch" : fmtDist(d);
           if (label && label.textContent !== text) label.textContent = text;
         }
       });
-      for (const [id, btn] of wpEls.current) if (!list.slice(0, MAX_WAYPOINTS).some((c) => c.campaignId === id)) btn.hidden = true;
+      for (const [id, btn] of wpEls.current) if (!list.slice(0, MAX_WAYPOINTS).some((c) => c.id === id)) btn.hidden = true;
 
       // Creatures: spawn-in, idle, catching spin, caught swirl, leaving range.
       for (const [id, l] of live) {
@@ -569,14 +569,14 @@ export default function ARView({
 
   if (!active) return null;
 
-  const target = campaigns.find((c) => c.campaignId === selectedId) ?? campaigns[0] ?? null;
+  const target = campaigns.find((c) => c.id === selectedId) ?? campaigns[0] ?? null;
   const me = player.getPosition();
   const targetDist = target ? target.lngLat.distanceTo(me) : 0;
   const inRange = !!target && targetDist <= CATCH_RADIUS;
   const cycle = () => {
     if (campaigns.length < 2 || !target) return;
-    const i = campaigns.findIndex((c) => c.campaignId === target.campaignId);
-    onSelect(campaigns[(i + 1) % campaigns.length].campaignId);
+    const i = campaigns.findIndex((c) => c.id === target.id);
+    onSelect(campaigns[(i + 1) % campaigns.length].id);
   };
 
   const hint = !target
@@ -591,15 +591,15 @@ export default function ARView({
         <div className="wp-layer">
           {campaigns.slice(0, MAX_WAYPOINTS).map((c) => (
             <button
-              key={c.campaignId}
+              key={c.id}
               type="button"
               className="wp"
               hidden
               ref={(node) => {
-                if (node) wpEls.current.set(c.campaignId, node);
-                else wpEls.current.delete(c.campaignId);
+                if (node) wpEls.current.set(c.id, node);
+                else wpEls.current.delete(c.id);
               }}
-              onClick={() => onSelect(c.campaignId)}
+              onClick={() => onSelect(c.id)}
               aria-label={`${c.businessName} waypoint`}
             >
               <span className="wp-pin">

@@ -12,6 +12,7 @@ import { CATCH_RADIUS, VISIBLE_RADIUS, visibleCampaigns, type Campaign } from "@
 import { RARITIES, catchCreature, chainConfigured, spawnableCampaigns, type CatchPhase, type Caught } from "@/lib/chain";
 import { createCampaignModels } from "@/lib/campaignModels";
 import type { Player } from "@/lib/player";
+import type { Occlusion } from "@/lib/occlusion";
 import type { ARCatchOutcome } from "@/components/ARView";
 import CatchProgress from "@/components/CatchProgress";
 import CatchReveal, { type Reveal } from "@/components/CatchReveal";
@@ -36,6 +37,7 @@ const PAW_SVG =
 export default function Campaigns({
   map,
   player,
+  occlusion,
   wallet,
   devMode,
   arOpen,
@@ -43,6 +45,7 @@ export default function Campaigns({
 }: {
   map: mapboxgl.Map;
   player: Player;
+  occlusion: Occlusion;
   wallet: string;
   devMode: boolean;
   arOpen: boolean;
@@ -113,9 +116,9 @@ export default function Campaigns({
   const dist = useCallback((c: { lngLat: mapboxgl.LngLat }) => c.lngLat.distanceTo(pos), [pos]);
   const sorted = useMemo(() => [...campaigns].sort((a, b) => dist(a) - dist(b)), [campaigns, dist]);
   // Tapped marker if it's still on the map, otherwise the nearest campaign.
-  const selected = campaigns.find((c) => c.campaignId === selectedId) ?? sorted[0] ?? null;
+  const selected = campaigns.find((c) => c.id === selectedId) ?? sorted[0] ?? null;
 
-  // --- 3D creature models from Swarm, one per visible campaign at its Arkiv location (under the player) ---
+  // --- 3D creature models from Swarm, one per spawn point at its exact Arkiv location (under the player) ---
   const models = useRef<ReturnType<typeof createCampaignModels> | null>(null);
   useEffect(() => {
     const m = createCampaignModels(map);
@@ -132,14 +135,16 @@ export default function Campaigns({
     };
   }, [map]);
   useEffect(() => {
-    models.current?.set(campaigns.map((c) => ({ id: c.campaignId, lngLat: c.lngLat, url: c.modelUrl })));
-  }, [campaigns]);
+    models.current?.set(campaigns.map((c) => ({ id: c.id, lngLat: c.lngLat, url: c.modelUrl })));
+    // A creature placed inside a venue: flatten the building(s) at its spot so it stands there visibly.
+    occlusion.setAnchors(campaigns.map((c) => c.lngLat));
+  }, [campaigns, occlusion]);
 
-  // --- Markers: one per visible campaign, synced by campaignId ---
+  // --- Markers: one per spawn point, synced by spawn id ---
   type M = { marker: mapboxgl.Marker; el: HTMLDivElement; name: HTMLSpanElement };
   const markers = useRef(new Map<string, M>());
   useEffect(() => {
-    const live = new Set(campaigns.map((c) => c.campaignId));
+    const live = new Set(campaigns.map((c) => c.id));
     for (const [id, m] of markers.current) {
       if (!live.has(id)) {
         m.marker.remove();
@@ -147,7 +152,7 @@ export default function Campaigns({
       }
     }
     for (const c of campaigns) {
-      let m = markers.current.get(c.campaignId);
+      let m = markers.current.get(c.id);
       if (!m) {
         const el = document.createElement("div");
         el.className = "cm-marker";
@@ -156,19 +161,19 @@ export default function Campaigns({
         el.innerHTML = `<div class="cm-marker-label">${PAW_SVG}<span class="cm-marker-name"></span></div><div class="cm-marker-dot"></div>`;
         const pick = (e: Event) => {
           e.stopPropagation();
-          setSelectedId(c.campaignId);
+          setSelectedId(c.id);
         };
         el.addEventListener("click", pick);
         el.addEventListener("keydown", (e) => (e.key === "Enter" || e.key === " ") && pick(e));
         const marker = new mapboxgl.Marker({ element: el, anchor: "bottom", offset: [0, MARKER_LIFT] }).setLngLat(c.lngLat).addTo(map);
         m = { marker, el, name: el.querySelector(".cm-marker-name")! };
-        markers.current.set(c.campaignId, m);
+        markers.current.set(c.id, m);
       }
       m.marker.setLngLat(c.lngLat);
             m.name.textContent = c.businessName;
       m.el.setAttribute("aria-label", `${c.businessName} creature, ${fmtDist(dist(c))} away`);
       m.el.dataset.inRange = String(dist(c) <= CATCH_RADIUS);
-      m.el.dataset.selected = String(selected?.campaignId === c.campaignId);
+      m.el.dataset.selected = String(selected?.id === c.id);
     }
   }, [campaigns, selected, dist, map]);
 
@@ -185,7 +190,7 @@ export default function Campaigns({
     if (busy) return "failed";
     setCatchError("");
     setCatchTarget(target.businessName);
-    setSelectedId(target.campaignId);
+    setSelectedId(target.id);
     const at = player.getFix(); // CRE checks the real position against the campaign's on-chain spawn point
     try {
       const caught: Caught | null = await catchCreature(wallet as Address, target.campaignId, at.lat, at.lng, setPhase);
@@ -213,9 +218,9 @@ export default function Campaigns({
 
   const cycle = () => {
     if (sorted.length < 2 || !selected) return;
-    const i = sorted.findIndex((c) => c.campaignId === selected.campaignId);
+    const i = sorted.findIndex((c) => c.id === selected.id);
     const next = sorted[(i + 1) % sorted.length];
-    setSelectedId(next.campaignId);
+    setSelectedId(next.id);
   };
 
   const showProgress = busy || catchError !== "" || (phase !== null && phase !== "caught");
@@ -256,7 +261,7 @@ export default function Campaigns({
         setOpen={setArOpen}
         disabled={devMode}
         campaigns={sorted}
-        selectedId={selected?.campaignId ?? null}
+        selectedId={selected?.id ?? null}
         onSelect={setSelectedId}
         busy={busy}
         onCatch={catchAt}
