@@ -35,7 +35,7 @@ export async function POST(req: Request) {
 
   // 4. One human <-> one wallet.
   let result;
-  try { result = loginPlayer(r.nullifier, wallet); } catch { return deny("Verification failed"); }
+  try { result = await loginPlayer(r.nullifier, wallet); } catch { return deny("Verification failed"); }
   if (!result.ok) return deny(result.error, 403);
 
   const out = NextResponse.json({ success: true, isNew: result.isNew });

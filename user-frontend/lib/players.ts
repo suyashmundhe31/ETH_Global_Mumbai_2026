@@ -1,26 +1,34 @@
-import fs from "fs";
+import { getCloudflareContext } from "@opennextjs/cloudflare";
 
-const FILE = "players.json"; // swap for a real DB later; keep the same functions
-type DB = Record<string, { wallet: string; createdAt: string }>;
-const load = (): DB => (fs.existsSync(FILE) ? JSON.parse(fs.readFileSync(FILE, "utf8")) : {});
+// Players live in the PLAYERS Workers KV namespace (wrangler.jsonc). `next dev` gets a local emulated
+// namespace through initOpenNextCloudflareForDev() in next.config.ts.
+//   player:<id>       -> { wallet, createdAt }   (id = World ID nullifier as a decimal string)
+//   wallet:<wallet>   -> <id>                    (reverse index, wallet lowercase)
+type Player = { wallet: string; createdAt: string };
 
-export const getPlayer = (id: string) => load()[id] ?? null;
+const kv = async () => (await getCloudflareContext({ async: true })).env.PLAYERS;
+
+export const getPlayer = async (id: string): Promise<Player | null> =>
+  (await kv()).get<Player>(`player:${id}`, "json");
+
+export const idByWallet = async (wallet: string): Promise<string | null> => (await kv()).get(`wallet:${wallet}`);
 
 // One human <-> one wallet. Wallet must be lowercase.
-export function loginPlayer(nullifierHex: string, wallet: string) {
+// KV is not transactional: two simultaneous first logins could race. Acceptable for this game.
+export async function loginPlayer(nullifierHex: string, wallet: string) {
   const id = BigInt(nullifierHex).toString(); // decimal avoids hex casing/format bugs
-  const db = load();
-  const mine = db[id];
+  const store = await kv();
+  const mine = await store.get<Player>(`player:${id}`, "json");
   if (mine) {
     // Known human: only their original wallet may log in.
     return mine.wallet === wallet ? { ok: true as const, id, isNew: false } : { ok: false as const, error: "This World ID is linked to a different wallet." };
   }
   // New human: the wallet must not already belong to someone else.
-  if (Object.values(db).some((p) => p.wallet === wallet)) {
+  if (await store.get(`wallet:${wallet}`)) {
     return { ok: false as const, error: "This wallet is linked to a different World ID." };
   }
-  db[id] = { wallet, createdAt: new Date().toISOString() };
-  fs.writeFileSync(FILE, JSON.stringify(db, null, 2));
+  const player: Player = { wallet, createdAt: new Date().toISOString() };
+  await store.put(`player:${id}`, JSON.stringify(player));
+  await store.put(`wallet:${wallet}`, id);
   return { ok: true as const, id, isNew: true };
 }
-export const idByWallet = (wallet: string) => Object.entries(load()).find(([, p]) => p.wallet === wallet)?.[0] ?? null;

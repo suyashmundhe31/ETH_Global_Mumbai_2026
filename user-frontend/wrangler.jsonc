@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "creature-map",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "services": [{ "binding": "WORKER_SELF_REFERENCE", "service": "creature-map" }],
+  // World ID <-> wallet links (lib/players.ts)
+  "kv_namespaces": [{ "binding": "PLAYERS" }],
+  "observability": { "enabled": true }
+  // Secrets (never in this file): wrangler secret put RP_SIGNING_KEY / ARKIV_ACCESS_KEY
+}

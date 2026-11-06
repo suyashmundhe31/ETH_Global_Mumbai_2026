@@ -8,7 +8,7 @@ export async function POST(req: Request) {
   if (!(await ownsWallet(b))) return NextResponse.json({ error: "Wallet signature check failed" }, { status: 400 });
 
   // Wallet already linked to a verified human -> log in without asking World ID again.
-  const id = idByWallet(b.address.toLowerCase());
+  const id = await idByWallet(b.address.toLowerCase());
   const out = NextResponse.json({ registered: !!id });
   if (id) out.cookies.set("session", sign(id), { httpOnly: true, sameSite: "lax", path: "/" });
   return out;
