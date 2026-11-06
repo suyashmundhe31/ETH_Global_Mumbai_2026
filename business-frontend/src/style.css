@@ -1,0 +1,76 @@
+:root {
+  --bg: #f5f6f8;
+  --panel: #fff;
+  --text: #1b1f24;
+  --muted: #5f6b7a;
+  --border: #d9dee5;
+  --accent: #3b5bdb;
+  --ok: #2b8a3e;
+  --bad: #c92a2a;
+  --common: #6b7280;
+  --rare: #1c7ed6;
+  --epic: #9c36b5;
+  --legendary: #e67700;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--text);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --panel: #1d2128;
+    --text: #e6e9ee;
+    --muted: #98a2b3;
+    --border: #2f3540;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); }
+code { font-size: 0.85em; word-break: break-all; }
+.topbar { display: flex; gap: 16px; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--panel); }
+.topbar h1 { font-size: 1.2rem; margin: 0; }
+.topbar .net { color: var(--muted); font-size: 0.85rem; flex: 1; }
+.layout { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; padding: 16px 20px; }
+@media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+.results { margin: 0 20px 20px; overflow-x: auto; }
+fieldset { border: 1px solid var(--border); border-radius: 8px; margin: 0 0 14px; padding: 10px 12px 12px; }
+legend { font-weight: 600; padding: 0 4px; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; color: var(--muted); margin-bottom: 8px; }
+input, select, button { font: inherit; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--text); }
+button { cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; width: 100%; padding: 11px; font-weight: 600; }
+button:disabled { opacity: 0.6; cursor: wait; }
+.row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.row label { flex: 1; min-width: 120px; }
+.row button { margin-bottom: 8px; }
+.counts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+@media (max-width: 600px) { .counts { grid-template-columns: repeat(2, 1fr); } }
+.rewards { width: 100%; border-collapse: collapse; }
+.rewards td, .rewards th { padding: 4px; text-align: left; font-size: 0.85rem; }
+.rewards input { width: 100%; }
+.map { height: 260px; border-radius: 8px; border: 1px solid var(--border); }
+.hint { font-size: 0.8rem; color: var(--muted); margin: 6px 0 0; }
+.hint.ok { color: var(--ok); }
+.hint.bad { color: var(--bad); }
+.errors { color: var(--bad); font-size: 0.9rem; }
+model-viewer { width: 100%; height: 340px; background: radial-gradient(circle, rgba(128,128,128,0.15), transparent 70%); border-radius: 8px; }
+.steps { list-style: none; padding: 0; margin: 0 0 12px; }
+.steps li { padding: 8px 10px 8px 30px; border-left: 3px solid var(--border); position: relative; font-size: 0.9rem; }
+.steps li span { display: block; color: var(--muted); font-size: 0.8rem; margin-top: 2px; }
+.steps li::before { position: absolute; left: 8px; top: 8px; content: "○"; color: var(--muted); }
+.steps li.active { border-color: var(--accent); }
+.steps li.active::before { content: "◌"; color: var(--accent); }
+.steps li.done { border-color: var(--ok); }
+.steps li.done::before { content: "✓"; color: var(--ok); }
+.steps li.error { border-color: var(--bad); }
+.steps li.error::before { content: "✗"; color: var(--bad); }
+.summary { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; font-size: 0.85rem; }
+.summary dt { color: var(--muted); }
+.summary dd { margin: 0; }
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.results th, .results td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.r-COMMON { color: var(--common); font-weight: 600; }
+.r-RARE { color: var(--rare); font-weight: 600; }
+.r-EPIC { color: var(--epic); font-weight: 600; }
+.r-LEGENDARY { color: var(--legendary); font-weight: 600; }
+.actions { margin-bottom: 8px; }

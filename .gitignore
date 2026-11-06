@@ -1,4 +1,4 @@
-# Dependencies
+# ---------------------------------------------------------------- dependencies
 node_modules/
 .pnp
 .pnp.*
@@ -8,61 +8,75 @@ node_modules/
 !.yarn/releases
 !.yarn/versions
 
-# Next.js build output
+# ---------------------------------------------------------------- build output
+# user-frontend (Next.js)
 .next/
 out/
 build/
+# business-frontend (Vite)
 dist/
+.vite/
 
 # TypeScript
 *.tsbuildinfo
 next-env.d.ts
 
-# Environment variables / secrets
+# ---------------------------------------------------------------- environment variables / secrets
 .env
 .env.*
+*.env
 !.env.example
-user-frontend/.env
-cre/.env
-cre/workflow/.env
+*.pem
+signing-key-*.json
 
-# Logs
+# ---------------------------------------------------------------- runtime data
+# user-frontend: World ID nullifier <-> wallet store
+players.json
+# worker: Arkiv / Swarm progress journal
+worker/data/*.json
+worker/data/tmp/
+
+# ---------------------------------------------------------------- contracts (Foundry)
+contracts/out/
+contracts/cache/
+# local chains (Anvil 31337 dev, 31338 e2e)
+contracts/broadcast/*/31337/
+contracts/broadcast/*/31338/
+contracts/deployments/31337.json
+contracts/deployments/31338.json
+# simulations and lock files are never needed
+contracts/broadcast/**/dry-run/
+*.recovery.lock
+deployments
+
+# ---------------------------------------------------------------- logs / tests / tooling
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 *.log
-
-# Testing
 coverage/
-
-# Vercel
 .vercel
-
-# Misc
-*.pem
 .cache/
 .turbo/
-signing-key-*.json
-players.json
+.claude
 
-# OS files
+# ---------------------------------------------------------------- OS / editors
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Editors / IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-# Foundry (cre/)
+
+# ---------------------------------------------------------------- Chainlink CRE (cre/)
+user-frontend/.env
+cre/.env
+cre/workflow/.env
 cre/out/
 cre/cache/
 cre/broadcast/
-# CRE build leftovers
 .cre_build_tmp.js
 *.wasm
-
-
