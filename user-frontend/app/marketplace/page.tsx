@@ -8,23 +8,16 @@ async function Marketplace() {
   const player = await currentPlayer();
   if (!player) redirect("/");
   return (
-    <main style={PAGE}>
-      <NavBar />
-      <h1>Marketplace</h1>
-      <Market wallet={player.wallet} />
-    </main>
+    <>
+      <NavBar wallet={player.wallet} />
+      <main className="page">
+        <div className="page-inner">
+          <Market wallet={player.wallet} />
+        </div>
+      </main>
+    </>
   );
 }
-
-const PAGE: React.CSSProperties = {
-  minHeight: "100%",
-  overflowY: "auto",
-  boxSizing: "border-box",
-  padding: "calc(88px + env(safe-area-inset-top)) 16px 24px",
-  background: "#141820",
-  color: "#fff",
-  font: "16px system-ui, sans-serif",
-};
 
 export default function Page() {
   return (

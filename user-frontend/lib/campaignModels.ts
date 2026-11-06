@@ -16,6 +16,7 @@ type Entry = CampaignModel & { obj: THREE.Object3D | null; phase: number };
 export function createCampaignModels(map: mapboxgl.Map) {
   const entries = new Map<string, Entry>();
   let destroyed = false;
+  let visible = true;
 
   const scene = new THREE.Scene();
   const camera = new THREE.Camera();
@@ -70,7 +71,7 @@ export function createCampaignModels(map: mapboxgl.Map) {
     },
     render(_gl, matrix) {
       const shown = [...entries.values()].filter((e) => e.obj);
-      if (!renderer || !shown.length) return;
+      if (!renderer || !shown.length || !visible) return;
       // Scene units: metres from the first campaign (x = east, y = up, z = south).
       const origin = shown[0].lngLat;
       const m = mapboxgl.MercatorCoordinate.fromLngLat(origin, 0);
@@ -98,6 +99,11 @@ export function createCampaignModels(map: mapboxgl.Map) {
   return {
     layer,
     set,
+    /** Hidden in the AR minimap (its markers shrink to dots there). */
+    setVisible(on: boolean) {
+      visible = on;
+      map.triggerRepaint();
+    },
     destroy() {
       destroyed = true;
       entries.clear();

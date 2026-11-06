@@ -1,54 +1,100 @@
 "use client";
 
+// Game-lobby navigation: illustrated tiles. A floating top bar on wide screens, a bottom tab bar on phones
+// (the active tile pops up out of the bar).
+
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useEffect, useRef, useState } from "react";
+import Avatar, { shortAddr } from "@/components/Avatar";
+import { ArtChest, ArtMap, ArtShop, BrandMark, IconCheck, IconCopy, IconLogout } from "@/components/icons";
 
 const LINKS = [
-  { href: "/", label: "🗺 Map" },
-  { href: "/profile", label: "👤 Profile" },
-  { href: "/marketplace", label: "🛒 Marketplace" },
+  { href: "/", label: "Map", Art: ArtMap },
+  { href: "/profile", label: "Collection", Art: ArtChest },
+  { href: "/marketplace", label: "Market", Art: ArtShop },
 ];
 
-export default function NavBar() {
+export default function NavBar({ wallet }: { wallet?: string }) {
   const path = usePathname();
+  const [menu, setMenu] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = (e: PointerEvent | KeyboardEvent) => {
+      if (e instanceof KeyboardEvent ? e.key === "Escape" : !menuRef.current?.contains(e.target as Node)) setMenu(false);
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", close);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("keydown", close);
+    };
+  }, [menu]);
+
+  const copy = () => {
+    if (!wallet) return;
+    navigator.clipboard
+      ?.writeText(wallet)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1400);
+      })
+      .catch(() => null);
+  };
+
+  const signOut = async () => {
+    await fetch("/api/logout", { method: "POST" }).catch(() => null);
+    location.href = "/";
+  };
+
   return (
-    <nav
-      style={{
-        position: "fixed",
-        top: "calc(12px + env(safe-area-inset-top))",
-        left: "50%",
-        transform: "translateX(-50%)",
-        zIndex: 10,
-        display: "flex",
-        gap: 4,
-        padding: 4,
-        borderRadius: 24,
-        background: "rgba(20, 24, 32, 0.85)",
-        boxShadow: "0 2px 10px rgba(0, 0, 0, 0.35)",
-        font: "600 14px system-ui, sans-serif",
-        maxWidth: "calc(100vw - 24px)",
-      }}
-    >
-      {LINKS.map(({ href, label }) => {
-        const active = path === href;
-        return (
-          <Link
-            key={href}
-            href={href}
-            aria-current={active ? "page" : undefined}
-            style={{
-              padding: "10px 14px",
-              borderRadius: 20,
-              color: "#fff",
-              textDecoration: "none",
-              whiteSpace: "nowrap",
-              background: active ? "rgba(255, 255, 255, 0.18)" : "transparent",
-            }}
-          >
-            {label}
-          </Link>
-        );
-      })}
-    </nav>
+    <header className="nav">
+      <nav className="nav-bar" aria-label="Main">
+        <Link href="/" className="nav-brand" aria-label="Creature Map home">
+          <BrandMark />
+          <span className="nav-brand-name">Creature Map</span>
+        </Link>
+
+        <div className="nav-tabs">
+          {LINKS.map(({ href, label, Art }) => (
+            <Link key={href} href={href} className="nav-tab" aria-current={path === href ? "page" : undefined}>
+              <Art />
+              <span className="nav-tab-label">{label}</span>
+            </Link>
+          ))}
+        </div>
+
+        {wallet && (
+          <div ref={menuRef} style={{ position: "relative", display: "flex" }}>
+            <button type="button" className="nav-wallet" aria-haspopup="menu" aria-expanded={menu} aria-label="Wallet" onClick={() => setMenu((m) => !m)}>
+              <Avatar address={wallet} />
+              <span className="nav-wallet-addr num">{shortAddr(wallet)}</span>
+            </button>
+            {menu && (
+              <div role="menu" className="panel nav-menu">
+                <div className="nav-menu-head">
+                  <Avatar address={wallet} size={40} />
+                  <div style={{ minWidth: 0 }}>
+                    <strong>Your wallet</strong>
+                    <span className="num">{shortAddr(wallet)}</span>
+                  </div>
+                </div>
+                <button type="button" role="menuitem" className="btn btn-ghost btn-sm btn-block" style={{ justifyContent: "flex-start" }} onClick={copy}>
+                  {copied ? <IconCheck /> : <IconCopy />}
+                  {copied ? "Copied" : "Copy address"}
+                </button>
+                <button type="button" role="menuitem" className="btn btn-ghost btn-sm btn-block" style={{ justifyContent: "flex-start", color: "var(--danger)" }} onClick={() => void signOut()}>
+                  <IconLogout />
+                  Sign out
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </nav>
+    </header>
   );
 }

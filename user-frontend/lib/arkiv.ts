@@ -253,7 +253,7 @@ export async function listedSellers(): Promise<Map<string, Address>> {
   return out;
 }
 
-export type CreatureRow = { key: Hex; owner: Address; businessName: string; rarity: string; description: string; listed: boolean; redeemed: boolean };
+export type CreatureRow = { key: Hex; owner: Address; businessName: string; rarity: string; description: string; listed: boolean; redeemed: boolean; modelUrl: string };
 
 /** Arkiv entity of each creature id (whoever holds it now), keyed by id; ids with no entity are missing. */
 export async function creatureRows(ids: bigint[]): Promise<Map<string, CreatureRow>> {
@@ -261,14 +261,14 @@ export async function creatureRows(ids: bigint[]): Promise<Map<string, CreatureR
     ids.map(async (id) => {
       const [r] = (
         await client
-          .select({ $key: true, $owner: true, businessName: true, rarity: true, discountDescription: true, listed: true, redeemed: true })
+          .select({ $key: true, $owner: true, businessName: true, rarity: true, discountDescription: true, listed: true, redeemed: true, swarmReference: true })
           .from(CreatureSchema)
           .where(eq("creatureId", str(id.toString())))
           .createdBy(CREATURE_OWNER)
           .limit(1)
           .fetch()
       ).entities;
-      return r ? ([id.toString(), { key: r.$key, owner: r.$owner, businessName: r.businessName.value, rarity: r.rarity.value, description: r.discountDescription.value, listed: r.listed.value, redeemed: r.redeemed.value }] as const) : null;
+      return r ? ([id.toString(), { key: r.$key, owner: r.$owner, businessName: r.businessName.value, rarity: r.rarity.value, description: r.discountDescription.value, listed: r.listed.value, redeemed: r.redeemed.value, modelUrl: swarmUrl(r.swarmReference.value) }] as const) : null;
     }),
   );
   return new Map(rows.filter((r) => r !== null));

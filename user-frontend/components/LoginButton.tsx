@@ -1,6 +1,7 @@
 "use client";
 import { useState } from "react";
 import { IDKitRequestWidget, proofOfHuman, type RpContext } from "@worldcoin/idkit";
+import { IconAlert, IconWallet } from "@/components/icons";
 
 type Eth = { request: (a: { method: string; params?: unknown[] }) => Promise<unknown> };
 
@@ -12,9 +13,11 @@ export default function LoginButton() {
   const [msg, setMsg] = useState("");
   // No injected wallet (e.g. Safari on iPhone): link that reopens this page inside the MetaMask app's browser.
   const [openInMetaMask, setOpenInMetaMask] = useState("");
+  const [busy, setBusy] = useState(false);
 
   async function start() {
     setMsg("");
+    setBusy(true);
     try {
       const eth = (window as unknown as { ethereum?: Eth }).ethereum;
       if (!eth) {
@@ -50,18 +53,29 @@ export default function LoginButton() {
     } catch (e) {
       console.error(e);
       const err = e as { code?: number; message?: string };
-      setMsg(err.code === 4001 ? "Wallet request rejected" : `Error: ${err.message ?? e}`);
+      setMsg(err.code === 4001 ? "You rejected the wallet request. Try again when you're ready." : `Error: ${err.message ?? e}`);
+    } finally {
+      setBusy(false);
     }
   }
 
   return (
     <>
-      <button onClick={start}>Connect wallet &amp; verify with World ID</button>
-      <p>{msg}</p>
+      <button type="button" className="btn btn-primary btn-lg btn-block" onClick={start} disabled={busy}>
+        {busy ? <span className="spinner" /> : <IconWallet />}
+        {busy ? "Check your wallet…" : "Connect wallet & verify"}
+      </button>
+      <p style={{ marginTop: 10, color: "var(--text-3)", fontSize: 13, textAlign: "center" }}>One human, one hunter: verified once with World ID.</p>
+      {msg && (
+        <div className="notice notice-error login-msg" role="alert">
+          <IconAlert />
+          <span>{msg}</span>
+        </div>
+      )}
       {openInMetaMask && (
-        <p>
-          <a href={openInMetaMask}>🦊 Open in MetaMask</a>
-        </p>
+        <a href={openInMetaMask} className="btn btn-secondary btn-block" style={{ marginTop: 10 }}>
+          Open in the MetaMask app
+        </a>
       )}
       {rp && (
         <IDKitRequestWidget

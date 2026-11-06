@@ -3,43 +3,40 @@
 import { useEffect, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 import "mapbox-gl/dist/mapbox-gl.css";
-import { createPlayer } from "@/lib/player";
+import { createPlayer, type GpsStatus, type Player } from "@/lib/player";
+import { createOcclusion, occludedPaint } from "@/lib/occlusion";
 import Campaigns from "@/components/Campaigns";
-import Collection from "@/components/Collection";
 import { ROAD_OFFSETS, buildStreetlights } from "@/lib/streetlights";
 import { drawFacade, facadeLighting, facadePixelRatio, lightPresetFor, type FacadeType, type LightPreset } from "@/lib/facades";
+import Avatar from "@/components/Avatar";
+import { ArtGear, IconAlert, IconCamera, IconClock, IconClose, IconLocate, IconMoon, IconSettings, IconSun, IconSunrise, IconSunset } from "@/components/icons";
 
 type LightMode = "auto" | LightPreset;
 const GREEN: mapboxgl.FilterSpecification = [
   "match", ["get", "class"], ["park", "wood", "scrub", "grass", "agriculture", "pitch", "cemetery"], true, false,
 ];
-const MODES: LightMode[] = ["auto", "dawn", "day", "dusk", "night"];
-const LABELS: Record<LightMode, string> = { auto: "🕒 Auto", dawn: "🌅 Dawn", day: "☀️ Day", dusk: "🌇 Dusk", night: "🌙 Night" };
-
-const BUTTON: React.CSSProperties = {
-  position: "fixed",
-  bottom: "calc(24px + env(safe-area-inset-bottom))",
-  minHeight: 48,
-  padding: "0 18px",
-  border: "none",
-  borderRadius: 24,
-  background: "rgba(20, 24, 32, 0.85)",
-  color: "#fff",
-  font: "600 15px system-ui, sans-serif",
-  boxShadow: "0 2px 10px rgba(0, 0, 0, 0.35)",
-  touchAction: "manipulation",
-};
+const MODES: { id: LightMode; label: string; Icon: typeof IconSun }[] = [
+  { id: "auto", label: "Auto", Icon: IconClock },
+  { id: "dawn", label: "Dawn", Icon: IconSunrise },
+  { id: "day", label: "Day", Icon: IconSun },
+  { id: "dusk", label: "Dusk", Icon: IconSunset },
+  { id: "night", label: "Night", Icon: IconMoon },
+];
+const DEFAULT_PITCH = 60; // third-person view behind the character
 
 export default function GameMap({ wallet }: { wallet: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [mode, setMode] = useState<LightMode>("auto");
   const modeRef = useRef<LightMode>("auto");
   const applyPresetRef = useRef<((p: LightPreset) => void) | null>(null);
-  // Dev mode (click map to walk) is on by default in `npm run dev`, off in production builds.
-  const [devMode, setDevMode] = useState(process.env.NODE_ENV !== "production");
+  // The game always starts on real GPS. Dev mode (free roam, no AR) is an explicit opt-in from Settings.
+  const [devMode, setDevMode] = useState(false);
   const devModeRef = useRef(devMode);
-  const playerRef = useRef<ReturnType<typeof createPlayer> | null>(null);
-  const [world, setWorld] = useState<{ map: mapboxgl.Map; getPlayerPos: () => mapboxgl.LngLat } | null>(null);
+  const [gps, setGps] = useState<GpsStatus>({ kind: "locating" });
+  const [bearing, setBearing] = useState(0);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [arOpen, setArOpen] = useState(false);
+  const [world, setWorld] = useState<{ map: mapboxgl.Map; player: Player } | null>(null);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -49,17 +46,27 @@ export default function GameMap({ wallet }: { wallet: string }) {
     const map = new mapboxgl.Map({
       container: containerRef.current,
       style: process.env.NEXT_PUBLIC_MAPBOX_STYLE!,
-      center: [72.8636, 19.0656], // Jio World Convention Centre, BKC, Mumbai
-      zoom: 17,
-      minZoom: 15,
-      maxZoom: 22,
-      pitch: 55,
+      center: [72.8636, 19.0656], // Jio World Convention Centre, BKC, Mumbai (until the first GPS fix)
+      zoom: 18.3,
+      minZoom: 16,
+      maxZoom: 21,
+      pitch: DEFAULT_PITCH,
       maxPitch: 65,
       antialias: true,
+      attributionControl: false,
     });
+    map.addControl(new mapboxgl.AttributionControl({ compact: true }), "bottom-right");
 
     let alive = true;
     let clock: ReturnType<typeof setInterval> | undefined;
+    let occlusion: ReturnType<typeof createOcclusion> | null = null;
+    let player: Player | null = null;
+
+    let bearingRaf = 0;
+    map.on("rotate", () => {
+      cancelAnimationFrame(bearingRaf);
+      bearingRaf = requestAnimationFrame(() => setBearing(map.getBearing()));
+    });
 
     const loadImage = (name: string, url: string) =>
       new Promise<void>((resolve, reject) =>
@@ -84,6 +91,7 @@ export default function GameMap({ wallet }: { wallet: string }) {
       setBasemap("show3dBuildings", false);
       setBasemap("show3dLandmarks", false);
       setBasemap("show3dTrees", true);
+      setBasemap("showPointOfInterestLabels", false);
 
       let preset: LightPreset = modeRef.current === "auto" ? lightPresetFor() : modeRef.current;
       setBasemap("lightPreset", preset);
@@ -153,6 +161,8 @@ export default function GameMap({ wallet }: { wallet: string }) {
       // Dusk/night glow fades out as you zoom out (zoom 15 → 40%, zoom 17+ → full).
       const glow: mapboxgl.ExpressionSpecification = ["interpolate", ["linear"], ["zoom"], 15, 0.4, 17, 1];
       const height: mapboxgl.ExpressionSpecification = ["to-number", ["get", "height"], 0];
+      // Buildings right next to the player go flat (see lib/occlusion.ts), so the avatar never clips into a wall.
+      const occluded = occludedPaint(height);
       let tileZoom = Math.floor(map.getZoom());
 
       // One image per (type, zoom, lighting), created on first use. map.updateImage() can't be used:
@@ -183,21 +193,17 @@ export default function GameMap({ wallet }: { wallet: string }) {
         type: "fill-extrusion",
         paint: {
           "fill-extrusion-pattern": facadePattern(),
-          "fill-extrusion-height": height,
-          "fill-extrusion-base": ["to-number", ["get", "min_height"], 0],
+          ...occluded.walls,
           "fill-extrusion-emissive-strength": facadeLighting(preset) === "day" ? 0 : glow,
         },
       });
       // Terrace: thin plain grey concrete slab on top of the walls (hides the pattern on the roof).
+      // Flattened buildings keep only this slab at ground level: a clean footprint on the map.
       map.addLayer({
         ...building,
         id: "building-terrace",
         type: "fill-extrusion",
-        paint: {
-          "fill-extrusion-color": "#a4a4a0",
-          "fill-extrusion-base": height,
-          "fill-extrusion-height": ["+", height, 0.2],
-        },
+        paint: occluded.terrace,
       });
       // Terrace border: 1 m parapet wall around the roof edge.
       map.addLayer({
@@ -207,8 +213,7 @@ export default function GameMap({ wallet }: { wallet: string }) {
         paint: {
           "fill-extrusion-color": "#8c8c88",
           "fill-extrusion-line-width": 0.4,
-          "fill-extrusion-base": height,
-          "fill-extrusion-height": ["+", height, 1],
+          ...occluded.parapet,
         },
       });
 
@@ -314,18 +319,19 @@ export default function GameMap({ wallet }: { wallet: string }) {
       }, 60_000);
 
       // --- Player avatar (three.js custom layer, drawn on top) ---
-      const player = createPlayer(map, devModeRef.current);
-      playerRef.current = player;
+      player = createPlayer(map, { devMode: devModeRef.current, onStatus: setGps });
       map.addLayer(player.layer);
-      setWorld({ map, getPlayerPos: player.getPosition });
+      occlusion = createOcclusion(map, player.getPosition);
+      setWorld({ map, player });
     });
 
     return () => {
       alive = false;
       applyPresetRef.current = null;
       clearInterval(clock);
-      playerRef.current?.destroy();
-      playerRef.current = null;
+      cancelAnimationFrame(bearingRaf);
+      occlusion?.destroy();
+      player?.destroy();
       setWorld(null);
       map.remove();
     };
@@ -338,31 +344,207 @@ export default function GameMap({ wallet }: { wallet: string }) {
 
   useEffect(() => {
     devModeRef.current = devMode;
-    playerRef.current?.setDevMode(devMode);
-  }, [devMode]);
+    world?.player.setDevMode(devMode);
+  }, [devMode, world]);
+
+  const changeDevMode = (on: boolean) => {
+    setDevMode(on);
+    if (on) setArOpen(false); // AR needs real GPS and a real camera: dev mode turns it off
+  };
+
+  const resetView = () => {
+    if (!world) return;
+    world.player.recenter();
+    world.map.easeTo({ bearing: 0, pitch: DEFAULT_PITCH, duration: 450 });
+  };
+
+  const showLocating = !devMode && world && gps.kind !== "live" && gps.kind !== "dev";
 
   return (
     <>
-      <div ref={containerRef} style={{ position: "fixed", inset: 0 }} />
-      {world && <Campaigns map={world.map} getPlayerPos={world.getPlayerPos} wallet={wallet} />}
-      <Collection wallet={wallet} />
-      <button
-        type="button"
-        aria-label="Switch time of day"
-        onClick={() => setMode(MODES[(MODES.indexOf(mode) + 1) % MODES.length])}
-        style={{ ...BUTTON, right: "calc(16px + env(safe-area-inset-right))" }}
-      >
-        {LABELS[mode]}
-      </button>
-      <button
-        type="button"
-        aria-label="Toggle dev mode"
-        aria-pressed={devMode}
-        onClick={() => setDevMode((d) => !d)}
-        style={{ ...BUTTON, left: "calc(16px + env(safe-area-inset-left))" }}
-      >
-        {devMode ? "🛠 Dev: tap to walk" : "📍 GPS"}
-      </button>
+      <div ref={containerRef} className="map-stage" />
+      {world && (
+        <Campaigns map={world.map} player={world.player} wallet={wallet} devMode={devMode} arOpen={arOpen} setArOpen={setArOpen} />
+      )}
+
+      <div className="hud hud-status" aria-live="polite">
+        <span className="player-badge" aria-hidden="true">
+          <Avatar address={wallet} size={40} />
+        </span>
+        <StatusChip gps={gps} />
+      </div>
+
+      <div className="hud hud-rail">
+        <button type="button" className="gear-btn" aria-label="Settings" aria-expanded={settingsOpen} onClick={() => setSettingsOpen(true)}>
+          <ArtGear />
+        </button>
+        <button type="button" className="icon-btn icon-btn-stone" aria-label="Reset view to north" onClick={resetView} title="Reset view">
+          <svg viewBox="0 0 24 24" className="icon" aria-hidden="true" style={{ transform: `rotate(${-bearing}deg)`, filter: "none" }}>
+            <path d="M12 2.5 16 12H8l4-9.5Z" fill="#ff5d5d" stroke="#0b1630" strokeWidth="1.6" strokeLinejoin="round" />
+            <path d="M12 21.5 8 12h8l-4 9.5Z" fill="#fff" stroke="#0b1630" strokeWidth="1.6" strokeLinejoin="round" />
+          </svg>
+        </button>
+        {!devMode && (
+          <button type="button" className="icon-btn icon-btn-yellow" aria-label="Open AR camera" onClick={() => setArOpen(true)} title="AR camera">
+            <IconCamera />
+          </button>
+        )}
+      </div>
+
+      {showLocating && <Locating gps={gps} onDev={() => changeDevMode(true)} />}
+
+      {settingsOpen && (
+        <Settings
+          mode={mode}
+          setMode={setMode}
+          devMode={devMode}
+          setDevMode={changeDevMode}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
+    </>
+  );
+}
+
+function StatusChip({ gps }: { gps: GpsStatus }) {
+  switch (gps.kind) {
+    case "live":
+      return (
+        <span className="chip chip-live">
+          <span className="chip-dot">
+            <IconLocate />
+          </span>
+          GPS <span className="num">±{gps.accuracy} m</span>
+        </span>
+      );
+    case "dev":
+      return (
+        <span className="chip chip-dev">
+          <span className="chip-dot">
+            <IconSettings />
+          </span>
+          Dev mode
+        </span>
+      );
+    case "locating":
+      return (
+        <span className="chip chip-warn">
+          <span className="chip-dot">
+            <span className="spinner" />
+          </span>
+          Locating…
+        </span>
+      );
+    default:
+      return (
+        <span className="chip chip-danger">
+          <span className="chip-dot">
+            <IconAlert />
+          </span>
+          Location off
+        </span>
+      );
+  }
+}
+
+function Locating({ gps, onDev }: { gps: GpsStatus; onDev: () => void }) {
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setSlow(true), 10_000);
+    return () => clearTimeout(t);
+  }, []);
+  const failed = gps.kind === "denied" || gps.kind === "unavailable";
+  return (
+    <div className="locating" role="status">
+      <div className="locating-card panel">
+        <div className="locating-pulse">
+          <IconLocate />
+        </div>
+        {gps.kind === "denied" ? (
+          <>
+            <h2>Location access is off</h2>
+            <p>Creatures spawn at real places, so the game needs your location. Allow location for this site in your browser settings, then reload.</p>
+          </>
+        ) : gps.kind === "unavailable" ? (
+          <>
+            <h2>No location fix</h2>
+            <p>{gps.message} Move to an open area or check that location services are on.</p>
+          </>
+        ) : (
+          <>
+            <h2>Finding your location</h2>
+            <p>{slow ? "Still searching. Step outside or near a window for a faster GPS fix." : "Hold on while we get a GPS fix."}</p>
+          </>
+        )}
+        {failed && (
+          <button type="button" className="btn btn-primary btn-block" onClick={() => location.reload()}>
+            Try again
+          </button>
+        )}
+        {(failed || slow) && (
+          <button type="button" className="btn btn-secondary btn-block" onClick={onDev} style={{ marginTop: failed ? 12 : 16 }}>
+            Explore in dev mode
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Settings({
+  mode,
+  setMode,
+  devMode,
+  setDevMode,
+  onClose,
+}: {
+  mode: LightMode;
+  setMode: (m: LightMode) => void;
+  devMode: boolean;
+  setDevMode: (on: boolean) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <>
+      <div className="sheet-scrim" onClick={onClose} />
+      <div className="sheet panel" role="dialog" aria-label="Settings">
+        <div className="sheet-title">
+          <h2>Settings</h2>
+          <button type="button" className="icon-btn icon-btn-stone" aria-label="Close settings" onClick={onClose} autoFocus>
+            <IconClose />
+          </button>
+        </div>
+        <div className="sheet-section">
+          <span className="sheet-label">Time of day</span>
+          <div className="segmented">
+            {MODES.map(({ id, label, Icon }) => (
+              <button key={id} type="button" aria-pressed={mode === id} onClick={() => setMode(id)}>
+                <Icon />
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="sheet-section">
+          <label className="switch-row">
+            <span>
+              <strong>Dev mode</strong>
+              <p>Roam freely without GPS. The AR camera is turned off while dev mode is on.</p>
+            </span>
+            <input type="checkbox" role="switch" className="switch" checked={devMode} onChange={(e) => setDevMode(e.target.checked)} />
+          </label>
+          {devMode && (
+            <div className="dev-keys">
+              Tap or click the map to walk · <kbd>←</kbd> <kbd>↑</kbd> <kbd>→</kbd> <kbd>↓</kbd> move · <kbd>Shift</kbd> run · right-click to teleport
+            </div>
+          )}
+        </div>
+      </div>
     </>
   );
 }
